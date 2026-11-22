@@ -1,0 +1,229 @@
+# Master Prompt: Native Android Signal Analyzer with LAN Dashboard
+
+## Role and non-negotiable scope
+
+Build a new native Android application that migrates the existing local-first Signal Analyzer. It must run entirely on the Android device (no Python, Termux, Node-RED, laptop backend, or cloud backend for ordinary processing) and must expose a LAN-only browser dashboard served by that *same* Android application. The native UI and browser UI must use the same repository/services/database and must never become separate processing engines.
+
+Do **not** redesign, simplify, or silently change the current parsing, default-risk, duplicate-detection, candle-verification, result-classification, or P&L rules. Port them with behavior-oriented tests before optimizing or refactoring. Do not copy secrets from the legacy SQLite file into source control or logs.
+
+This specification was derived from the working source tree, not just its README. Source references are relative to the legacy project root.
+
+## Existing implementation: facts to preserve
+
+### Runtime and modules
+
+The legacy app is a Flask 3.1.3 application (`requirements.txt`) started by `run.py` on `0.0.0.0:8000`. `app/__init__.py:create_app` creates SQLite at `instance/signals.sqlite3`, initializes it, writes a scheduler boot marker, registers routes, and—outside test mode—starts two daemon threads:
+
+| File | Actual responsibility |
+| --- | --- |
+| `app/database.py` | SQLite schema/migrations; settings/default risk rules; notification ingest; duplicate/update classification; signal creation and scheduling. |
+| `app/parser.py` | The core category-specific parser, normalization, default SL/TP rules, aliases, sizing defaults. 1,519 lines. |
+| `app/verification.py` | Deterministic OHLC trade evaluator supporting multiple entry legs and market-now entries. |
+| `app/scheduler.py` | Provider selection, Angel instrument resolution, cached incremental candle fetching, verification/P&L persistence, periodic scheduler. |
+| `app/providers.py` | HTTP adapters for Twelve Data, Binance USD-M Futures, and Angel One SmartAPI; local RFC 6238 TOTP. |
+| `app/sync.py` | Google Apps Script/Sheets polling, payload validation/translation, sync logging. |
+| `app/routes.py` | Flask JSON API, CSV/backup endpoints, UI rendering, operational validation. |
+| `app/templates/index.html` | One-page dashboard shell with ten navigation views. |
+| `app/static/app.js` | Dashboard data loading, actions, parse-review dialog, custom interactive canvas OHLC chart, copy/selection behavior. |
+| `app/static/style.css` | Dark local-first dashboard design. |
+| `tests/test_app.py` | Legacy Flask/unit smoke tests. Extend its behavioral cases during migration. |
+
+There are no environment-variable reads and no `.env` implementation. Credentials are currently stored as JSON in `integrations.secrets_json`, plaintext in local SQLite; the replacement must improve this using Android Keystore-backed encrypted storage while retaining the same integration configuration semantics.
+
+### Implemented categories and input model
+
+The five seeded categories are `Crypto`, `Forex`, `Indian Options`, `Stock Options`, and `MCX`. Imported notification columns are exactly:
+
+`Received At`, `Notification Time`, `Source App`, `Package`, `Channel`, `Category`, `Title`, `Message`, `Notification ID`, `Delivery ID`.
+
+One raw notification can yield multiple signals. Raw notification ID is no longer unique in `signals`; this specifically supports multi-trade messages. A notification ID is unique in `raw_notifications` when supplied.
+
+### Parser: port behavioral rules exactly
+
+Port `app/parser.py` as a well-tested Kotlin domain module. Keep the named behaviors below (names may change only after parity tests exist).
+
+* `parse_signals(message, category, slRules)` routes `Crypto` to `_parse_crypto_signals`, `Forex`/`FX` to `_parse_forex_signals`, `MCX` to `_parse_mcx_signals`; Indian/Stock Options and unclassified inputs use `_parse_v34_hybrid`.
+* It normalizes Unicode superscript/circled digits (`SUP_MAP`), newlines, whitespace/noise, numeric commas, and aliases. Preserve `NOISE_WORDS`, `FALSE_FOREX_WORDS`, `MCX_COMMODITY_ALIASES`, `FOREX_SYMBOL_ALIASES`, and `FOREX_PAIRS` as data-driven Kotlin constants.
+* Parse result fields are: category, symbol, direction (`BUY`/`SELL`), `entryPrice`, `additionalEntries`, `stopLoss`, ordered `targets`, `optionType`, `strikePrice`, `expiryDate`, `entryMode` (`limit` or `market_now`), status (`parsed` or `needs_review`), confidence, manual-review state, explanation.
+* `_parse_v34_hybrid` detects category, symbols/contracts, CE/PE or CALL/PUT, strikes/expiry, explicit entry, SL and targets. It masks symbols/recognized segments before numeric extraction so option strikes, SL, target and entry values do not contaminate one another. Preserve direction-aware filters and its explanations/confidence, including explicit parsing issues.
+* Options recognition includes index underlyings such as NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, SENSEX; option contracts must retain `option_type`, strike and expiry when extracted.
+* Forex aliases include GOLD/XAU → `XAUUSD`, SILVER/XAG → `XAGUSD`, WTI/XTI → `USOIL`, BRENT/XBR → `UKOIL`; supported pair/index tokens are the source constants. `_forex_expand_entry_slice` handles ranges and abbreviated second numbers (for example `3724/20`), and `_forex_parse_target_line` must not mistake TP numbering for a price. BUY targets below the entry range and SELL targets above it are discarded.
+* Crypto recognizes slash/attached USDT/USDC/BUSD forms, strips leverage noise, supports `market_now`, ordered targets, and 2–10 independently parsed multi-coin blocks.
+* MCX maps aliases such as CRUDE, NATGAS, ALUMINUM and commodity minis to canonical symbols, supports multi-commodity blocks, and leaves option-shaped MCX messages to the hybrid parser.
+* Multi-trade splitting only applies where 2–10 headers exist and at least two parsed blocks have a symbol and direction; otherwise parse a single block.
+* An otherwise complete `symbol + direction + targets` message can be `market_now`; market price is resolved only from the first available signal-time candle later in processing.
+* At ingestion, a non-duplicate Forex follow-up within 30 minutes can inherit the most recent same-channel primary Forex symbol only when the new parse has direction and entry/market-now but no symbol. It becomes parsed with confidence `0.85`; preserve the explanation annotation.
+
+### Default SL/TP and sizing rules
+
+`DEFAULT_SL_SEED` in `app/parser.py` is product behavior, not illustrative data. Persist an equivalent editable rule document. Rule precedence is per-symbol (MCX key is `SYMBOL:OPT` or `SYMBOL:FUT`) then category default. Explicit parsed SL/targets are never overwritten.
+
+* Unit type: Forex = pips; Crypto = percentage of entry; everything else = points.
+* Forex pip size: XAUUSD/GOLD = 0.1; JPY pairs, XAGUSD, oils = 0.01; listed indices = 1; other FX = 0.0001.
+* Default SL uses the lowest entry for BUY / highest for SELL. Targets use the arithmetic mean of all entries. BUY adds offset, SELL subtracts it; preserve rounding and non-positive-price guards in `apply_default_sl` and `apply_default_targets`.
+* Default seed includes Indian index option values (for example NIFTY SL/TP 20/20/40/60 with 65 lot size and BANKNIFTY 40/40/80/120 with 30), MCX instrument profiles, Forex lot sizes, and Crypto USD capital defaults. Port the full literal seed from source—not a shortened approximation.
+* Every applied default must be represented in the explanation, including source profile, so dashboard flags remain meaningful. Persist lots, lot size, and crypto dollar capital with the rule.
+
+### Ingestion and duplicate behavior
+
+Implement `Database.ingest` semantics transactionally.
+
+* Reject a second identical non-empty `Notification ID` as `duplicate` before creating rows.
+* For same-channel messages within configurable `duplicate_window_minutes` (default 10): equal normalized messages are grouped; earliest is primary and later rows get `is_duplicate=1`, `duplicate_of`, a group ID, and reason `same normalized message from same channel within configured window`.
+* A richer message with detail markers (`ENTRY`, `TARGET`, `TP`, `SL`, `LEVERAGE`) and the same normalized subject (symbol + direction) is an update, not a duplicate. Associate a group and mark the newer raw row `duplicate_reason` as `signal_update: richer same-channel message with entries, targets, stop loss, or leverage`.
+* Duplicate signals are visible but never automatically verified. Legacy unclassified rows are backfilled non-destructively.
+* Parsed, non-duplicate signal rows with a symbol, BUY/SELL, and entry/market-now receive a schedule. Rows older than the initial wait at ingestion are `manual_required`, not auto-queued. Do not retroactively auto-queue historical notifications at app boot.
+
+### Candle verification and P&L: exact semantic contract
+
+Port `app/verification.py:verify_detailed` and `_evaluate_single_leg` directly into pure Kotlin with golden tests.
+
+1. Use ordered 1-minute OHLC candles at/after notification timestamp. A price is touched if `low - tolerance <= price <= high + tolerance`.
+2. Treat primary entry and each distinct additional entry as independent legs. Limit entries begin at their first touched candle. `market_now` enters leg 1 at candle 0 open (fallback close).
+3. For each leg, scan from its entry candle. Record TP events in target order, and retain the highest target reached. If SL and a *new* TP are touched in the same candle before any earlier TP on that leg, return that leg as `ambiguous` and stop it.
+4. An SL only ends a leg when no target has yet been hit on it. A leg stops scanning when all targets are hit.
+5. No candle → `awaiting_market_data`; missing direction/entry → `pending`; unhit limit entry → `pending`. Aggregate status precedence is: first TP anywhere → `target_hit`; then any ambiguity → `ambiguous`; then all entered legs SL → `stop_loss_hit`; else `entry_hit`.
+6. Persist event timeline, leg summaries, first entry/target/SL times, all-targets-hit, and explanatory text. Do not infer intrabar ordering beyond the stated same-candle ambiguity rule.
+7. P&L is sum of triggered legs: Crypto quantity is `usd_amount / entry`; other categories use `lots * effectiveLotSize`; `pointsPnl * quantity`. Crypto and Forex are USD; Indian/MCX are INR. An Angel master lot size overrides category profile only when there is no explicit symbol lot-size override.
+
+### Providers and market routing
+
+Keep provider access behind interfaces/repositories so the verification service only asks for normalized candles.
+
+| Legacy adapter | Migration requirement |
+| --- | --- |
+| `BinanceFutures` | Public USD-M `/fapi/v1/klines`, pagination to 1,500 candles (1,000 for spot mirror), fallback hosts plus `data-api.binance.vision`; supported intervals `1m,3m,5m,15m,30m,1h,2h,4h,1d`. Preserve retries/backoff and normalized UTC OHLCV. |
+| `TwelveData` | `/time_series`; supports `1min,5min,15min,1h,4h,1day`; requires configured key; records returned credit header/estimated credit in `api_request_log`. Converts six-letter FX symbols to slash notation when scheduling. |
+| `AngelOneProvider` | SmartAPI login via API key, client ID, password/PIN, RFC 6238 HMAC-SHA1 TOTP; searchScrip and historical candle endpoints; map internal intervals to `ONE_MINUTE` etc. Fetch/store official OpenAPIScripMaster and validate mappings against it. |
+
+`resolve_signal_provider` routes Crypto/USDT to Binance, Forex and recognized FX symbols to Twelve Data, otherwise Angel One. For Angel, lookup mappings first (`SYMBOL|EXPIRY|STRIKE|CE/PE`, then `SYMBOL|STRIKE|CE/PE`, then symbol), auto-resolve active contracts from master/live search, and show a clear missing-contract error. The scheduler may refresh Angel master at most once per 30 minutes when needed.
+
+Important source mismatch: README claims Forex download/verification is disabled, and the manual `/api/candles/fetch` endpoint rejects Forex; however current `scheduler.py` **does route Forex to Twelve Data** and processes it when configured. Implement the current source behavior and retain a user-visible configuration/error state when Twelve Data is unavailable.
+
+Persist deduplicated normalized candles. Existing identity is `(provider, symbol, exchange, interval, candle_timestamp)` (with older compatibility identity `(provider, symbol, timeframe, candle_time)`). Verification requests missing one-minute slices from signal minute through now, using cache coverage to avoid re-downloading existing ranges.
+
+### Scheduling, recovery, and limitations
+
+Legacy scheduler wakes every 10 seconds. It selects at most 25 due rows, atomically claims `scheduled → processing`, runs verification, then either completes/expires or reschedules. Defaults: initial wait 15 minutes, repeat 15 minutes, expiry 168 hours, retry missing candles 15 minutes; all are settings. `stop_loss_hit` and `ambiguous` are terminal. A `target_hit` is terminal only when all targets on all entered legs are hit; otherwise continue. On app boot, pending historical scheduled work older than the current initial wait becomes `manual_required`.
+
+Use a foreground-service-backed scheduler only while user enables “dedicated processing”, with a persistent notification and explicit battery-optimization guidance. Persist the schedule state and a lease/lock before execution; recover stale `processing` leases on startup. Use WorkManager for reboot/startup reconciliation, deferred catch-up and retry, not as a promise of minute-perfect continuous work. Document that Android can stop work under battery/network restrictions. Enforce network constraints and exponential retry for providers while maintaining the legacy retry semantics in state.
+
+## Android target architecture
+
+Build a single Kotlin Android project, minimum API level selected by the implementing agent based on current AndroidX/Ktor support. Recommended components:
+
+* Jetpack Compose native UI, ViewModels, Navigation, Coroutines/Flow.
+* Room over SQLite for all non-secret legacy tables, migrations, foreign keys/indexes, and transactional DAO operations.
+* Kotlin serialization for JSON columns/events/rules and HTTP payloads.
+* OkHttp for provider and Apps Script requests; use Android Keystore + encrypted preferences/database strategy for secrets.
+* Ktor embedded CIO/Netty server (whichever is Android-compatible and verified) running in the same foreground service/process, serving static dashboard assets plus versioned JSON APIs and WebSocket/SSE updates.
+* Repository/domain layering: parser engine, default-rule engine, ingestion service, market repository, verification engine, scheduling repository, sync worker. Both Compose and HTTP controllers call these same services.
+
+Do not try to execute the existing Python inside the APK. Translate parser and engine logic to Kotlin with tests. Do not make the HTTP dashboard call a second cloud process.
+
+### Room schema mapping
+
+Create Room entities/migrations for every current table (do not lose historical/audit data):
+
+| Table | Key content/constraints |
+| --- | --- |
+| `schema_version` | Current legacy version 2. |
+| `categories` | unique name, enabled. |
+| `channels` | unique name, category, enabled. |
+| `raw_notifications` | source fields above, import time; unique nullable notification ID; duplicate fields `is_duplicate`, `duplicate_of`, `duplicate_reason`, `duplicate_group_id`. |
+| `signals` | FK raw notification CASCADE; parsed trade fields; JSON additional entries/targets; entry mode; parsing/review/verification/final statuses and explanation. Index status and raw ID; no unique raw ID. |
+| `integrations` | unique provider, public config JSON, status/time. Store legacy secret JSON outside this table in Keystore-backed storage keyed by provider/field. |
+| `application_settings` | key PK, string value, updated time. |
+| `synchronization_logs`, `system_logs`, `api_request_log` | retain counts/details and bounded errors; no secret/request-body logging. |
+| `market_candles` | provider/symbol/exchange/interval/timestamp OHLCV/retrieved time; unique normalized key plus query lookup index. |
+| `instruments`, `instrument_mappings` | Angel master fields/token unique; mapping lookup key unique. |
+| `signal_analysis`, `trade_results` | audit decision and unique per-signal current results/timeline, P&L/currency/trade count/legs. |
+| `verification_schedules`, `verification_runs`, `parsing_runs` | one schedule per signal; run/audit FKs and due/run indexes. |
+
+Existing import strategy: make an explicit, opt-in, rollback-safe “Import legacy database” screen. First copy the supplied `signals.sqlite3` to app-private storage, validate schema/version, then import in a transaction preserving IDs where feasible or create an ID mapping that preserves every FK. Migrate `integrations.config_json`; prompt the user to re-enter secrets unless a deliberate encrypted import path is implemented. Verify row counts, foreign-key integrity, critical table hashes/counts, and preserve original database/backup untouched. SQLite backup files are not automatically imported.
+
+## Interfaces
+
+### Native Android UI
+
+Keep the legacy terminology and workflows, but make them mobile-appropriate. Required destinations:
+
+* Overview: notifications/parsed/today/TP/SL/pending, entry/win rate, INR/USD P&L, category/channel distributions, recent signals and sync/integration health.
+* Integrations: Google Apps Script, Binance, Twelve Data, Angel One; credential entry/masking, tests, instrument-master refresh.
+* Signal management: category/channel/status/notification-type filters, expansion into raw text/parse/legs/P&L/events, selection, manual edit, reparse, delete and batch verification.
+* Safe parse preview that does not write data.
+* Channel analytics; market-data contracts/catalog/cache coverage; settings/default SL/TP/size editor; reports/export/backup; system logs; notification log with history filters.
+* Individual signal parse-review and chart screens. Render signal OHLC with entry/TP/SL event markers, zoom/pan and crosshair equivalents to the existing custom canvas chart.
+* Processing/sync/server status, LAN URL/QR/copy action, access-token/session controls, and foreground-service/battery status.
+
+### Laptop browser dashboard
+
+Preserve the existing dark sidebar dashboard rather than replacing it with a generic admin template. Reuse `app/templates/index.html`, `app/static/style.css`, and `app/static/app.js` conceptually and, where practical, reuse/refactor their CSS/JS as Ktor-served assets. Existing views are Overview, Integrations & API, Signal Management, Signal Analyzer, Channel Analytics, Market Data, Reports & Export, Settings, System Logs, Notification Log.
+
+Retain: category bars/metrics, accordion signal cards, filters, parse-review dialog, batch controls, custom candle chart interactions, market contract selectors, default-rule editor, CSV exports and local backup. Make responsive enough for phone web view, but it must remain first-class on a laptop.
+
+### Embedded HTTP server/API
+
+Serve on a configurable port (default 8080), bind safely to LAN interfaces only when “LAN dashboard” is explicitly enabled, and display `http://DEVICE-LAN-IP:PORT`. Keep native loopback access available. HTTPS is optional only if implemented with a manageable local certificate; never imply public Internet exposure.
+
+Do not expose the legacy Flask API without protection: require a generated per-install bearer token or dashboard pairing flow for all state-changing endpoints, plus session/CSRF protections for browser use; keep the token out of URLs/logs. Default deny non-RFC1918/private source IPs; warn that LAN clients can control/delete/export data. Rate-limit auth failures. Native UI calls services directly, not the LAN API.
+
+Implement versioned `/api/v1/...` equivalents to these legacy endpoints, retaining compatible JSON shapes where dashboard reuse benefits:
+
+* `GET /`, overview, signals/filter/delete/update/chart/parse-detail/reparse/import/parse preview/settings/default-rule endpoints.
+* Integration CRUD, sync and sync logs; Binance test; Twelve candles/usage; Angel test/master/catalog/search/mapping/candles; cache coverage/delete.
+* Manual individual/batch verify and schedule history; channel analytics, system logs, CSV exports, and backup.
+
+Use WebSocket (or SSE fallback) events—`signal.changed`, `sync.completed`, `schedule.changed`, `market.cache.changed`, `log.appended`, `server.status`—so native and browser screens reflect persisted changes immediately. Events announce IDs/statuses; clients refetch authoritative data. Every mutation is performed by the same transactional services used by Compose.
+
+#### Existing endpoint contract to carry forward
+
+Use JSON request/response bodies except CSV downloads. Preserve failure convention `{ "error": "bounded actionable text" }` with 400 for validation errors, 404 for missing signals and 409 for duplicate verification. The versioned Android API may add metadata but should retain these payload fields for the reused dashboard.
+
+| Legacy operation | Request | Required response behavior |
+| --- | --- | --- |
+| `POST /api/import` | `{rows:[source-column objects]}` | Ingest each, return import/duplicate/skip/fail counts; parse may generate several signals. |
+| `POST /api/parse` | `{message, category?}` | Preview parse only; no write. |
+| `GET /api/signals` | query `category`, `channel`, `status`, `notification_filter` | Signals joined to raw data, JSON-decoded entries/targets/events/legs, age/status reason and P&L fields. |
+| `POST /api/signals/{id}` | editable parsed signal fields | Validate/recompute parse state as legacy `update_signal`; raw message remains separate. |
+| `POST /api/signals/{id}/reparse`, `POST /api/signals/reparse` | none / `{signal_ids:[...]}` | Reparse original raw message, write `parsing_runs`, preserve raw message, refresh schedules. |
+| `POST /api/signals/{id}/verify`, `POST /api/signals/process` | none / `{signal_ids:[...]}` | Run shared manual processor; batch deduplicates IDs and runs oldest notification first. |
+| `GET /api/signals/{id}/chart` | none | OHLC candles plus signal/event marker data used by canvas chart. |
+| `GET /api/notifications` | limit/status/type/channel/category/date range filters | Raw notification history, including duplicate/update classification; `GET /api/notification-filters` supplies filter values. |
+| `PUT /api/settings` | setting key/value map | Persist all supplied settings; `GET` returns map. |
+| `GET/PUT /api/default-sl`, `POST /api/default-sl/apply-missing` | rule document / none | Supply editable categories and current symbols; apply only missing SL/TP values to historical signals. |
+| `PUT/DELETE /api/integrations/{provider}` | `{config:{...}, secrets:{...}}` | Providers are only `google_sheets`, `binance`, `angel_one`, `twelve_data`; GET masks secrets and returns field names only. |
+| `POST /api/sync`; `GET /api/sync/logs` | none | Run/inspect Apps Script import. |
+| Market endpoints | provider-specific date/symbol/interval input | Binance `/api/candles/fetch`; Twelve `/api/twelve-data/candles`; Angel `/api/angel-one/candles`; each normalizes and caches OHLCV. Keep coverage, cache-delete, usage, catalog, instrument-search, mapping, test and master-refresh operations. |
+| Reporting | `GET /api/analytics/channels`, `/api/logs`, `/api/export/{raw|signals|channels}.csv`; `POST /api/backup` | Keep channel metrics, latest 300 logs, CSV streams, and local backup confirmation. |
+
+## Google Sheets contract and external error behavior
+
+Google Apps Script polling accepts either `{ok, server_time_ms, next_since_ms, total_new, data:{worksheet:[snake_case row]}}` or `{worksheets:{worksheet:[legacy-column row]}}`. Translate snake case exactly: `received_at`, `notification_time`, `source_app`, `package`, `channel`, `category`, `title`, `message`, `notification_id`, `delivery_id`. Require every source field before ingesting. Save `next_since_ms`; expose shape-only diagnostics, never notification data or secrets in exception logs.
+
+All provider/sync failures must be visible in synchronization/system/run records and status UI, retaining bounded useful messages. Do not fabricate demo data. Keep response parsing, interval validation, time-zone conversion, network timeout/retry behavior and malformed-candle skipping defensively implemented.
+
+## Implementation plan and tests
+
+1. Create Kotlin project, entities/DAOs/migrations, encrypted secret repository, import/backup strategy, and fixtures extracted from legacy tests without secret values.
+2. Port parser/default-rule engine. Add comprehensive golden tests for Options, Crypto, Forex, MCX, multi-signal, numeric ranges, aliases, `market_now`, missing fields, and inherited Forex context. Compare full parsed values/status/explanations where stable.
+3. Port verification/P&L as pure domain code. Test empty candles, tolerance, multi-leg entry, BUY/SELL P&L, TP-before-SL, SL-before-TP, same-candle ambiguity, continued multi-target monitoring, and market-open entry.
+4. Port ingestion, duplicate/update grouping, schedules, audit trails, provider routing/cache and Android recovery jobs.
+5. Add adapters with MockWebServer tests for all external contracts, pagination, timeouts, failed authentication, master validation and no-key states.
+6. Build Compose screens and Ktor dashboard/API from shared services. Add authenticated LAN integration tests and browser smoke tests.
+7. Implement opt-in legacy SQLite import and verify data preservation on a copy. Execute load/restart/network-loss/reboot-recovery tests on a physical Android device.
+
+### Acceptance criteria
+
+* No Python/Termux/laptop backend is required for processing.
+* The app supports all five categories and each implemented legacy flow, without claims for missing features.
+* Given the same fixture data, parser fields, default applications, verification statuses/events/legs, and P&L match legacy behavior.
+* Raw history, signals, schedules, analysis, results, candles, mappings, logs and settings survive app restart and safe migration.
+* Browser and native actions immediately present one shared persisted state; no duplicate processing engine exists.
+* Dedicated processing is honest about Android lifecycle limits, persists/recovers jobs, prevents concurrent duplicate processing, and reports provider/network failures.
+* The dashboard retains existing information architecture and interactive chart/table/filter capabilities, works via LAN with explicit authentication, and does not leak secrets.
+* Exports/backup and destructive actions retain confirmations and scoped targets. Tests cover the legacy cases in `tests/test_app.py` plus Android/LAN-specific behavior.
+
+## Known gaps and caution points
+
+The legacy project has no migrations directory, authentication, WebSocket stream, native Android client, push notification ingestion, formal API schema, or encrypted secrets. These are proposed Android additions, not existing behavior. The current tests import `verify` even though the inspected `app/verification.py` exposes `verify_detailed`; resolve that test/source inconsistency during parity testing rather than inventing a different verification rule. Treat current source code as authoritative when it conflicts with README text.

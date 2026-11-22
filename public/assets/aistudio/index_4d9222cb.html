@@ -1,0 +1,203 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Trading Signal Analyzer</title><style>{{ inline_css|safe }}</style><style>
+/* Fallback for a template refresh while Flask's Python worker is restarting. */
+:root{--bg:#0b1020;--panel:#141c31;--line:#263554;--text:#e7edf9;--muted:#94a3bd;--accent:#62d6a5}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px system-ui,sans-serif;display:flex}aside{width:240px;min-height:100vh;padding:26px 16px;position:fixed;background:#0d1426;border-right:1px solid var(--line)}.brand{font-size:20px;font-weight:800;color:var(--accent);padding:0 12px 28px}.brand small{font-size:11px;color:var(--muted);letter-spacing:3px}nav button{width:100%;border:0;background:transparent;color:var(--muted);padding:12px;text-align:left;border-radius:7px;cursor:pointer}nav button.active,nav button:hover{background:#1e2b49;color:#fff}.foot{position:absolute;bottom:8px;color:var(--muted);font-size:11px;padding:12px}main{margin-left:240px;width:calc(100% - 240px);padding:30px;max-width:1500px}header{display:flex;justify-content:space-between;margin-bottom:26px}h1,h2{margin:0 0 8px}h1{font-size:28px}h2{font-size:16px}.muted,#sub{color:var(--muted)}#health{color:var(--accent)}.view{display:none}.view.active{display:block}.metrics,.grid{display:grid;gap:16px;margin-bottom:16px}.metrics{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}.grid{grid-template-columns:1fr 1fr}.metric,article{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px;margin-bottom:16px}.metric b{display:block;font-size:25px;color:var(--accent);margin-top:8px}.metric span,label{color:var(--muted)}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid var(--line);text-align:left}button,.actions a{border:1px solid var(--line);background:#1a2743;color:var(--text);border-radius:6px;padding:9px 12px;cursor:pointer}.primary{background:var(--accent)!important;color:#062019!important}.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}.form-grid label,label{display:grid;gap:6px}input,select,textarea{background:#0c1426;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:10px}.category-filters{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:16px 0}.category-filter{padding:14px;text-align:left}.signal-filters,.actions{display:flex;gap:12px;align-items:end;flex-wrap:wrap}output,pre{display:block;white-space:pre-wrap;color:var(--accent)}@media(max-width:760px){body{display:block}aside{width:100%;min-height:auto;position:sticky;top:0;z-index:20;padding:10px 12px;border-right:0;border-bottom:1px solid var(--line)}.brand{padding:0 0 8px;font-size:16px}nav{display:flex;gap:6px;overflow-x:auto;padding-bottom:4px}nav button{width:auto;white-space:nowrap;padding:8px 10px;font-size:12px}main{margin-left:0;width:100%;padding:14px}.grid{grid-template-columns:1fr}}
+</style></head><body>
+<aside><div class="brand">SIGNAL<br><small>ANALYZER</small></div><nav><button class="active" data-view="overview">Overview</button><button data-view="integrations">Integrations &amp; API</button><button data-view="signals">Signal Management</button><button data-view="analyzer">Signal Analyzer</button><button data-view="analytics">Channel Analytics</button><button data-view="market">Market Data</button><button data-view="reports">Reports &amp; Export</button><button data-view="settings">Settings</button><button data-view="logs">System Logs</button><button data-view="notifications">Notification Log</button></nav><p class="foot">Local-first v2.1</p></aside>
+<main><header><div><h1 id="page-title">Overview</h1><p id="sub">Notifications, parsed signals, and verification at a glance.</p></div><span id="health">Local database ready</span></header>
+<section id="overview" class="view active"><div id="metrics" class="metrics"></div><div class="grid"><article><h2>Category distribution</h2><div id="categories" class="bars"></div></article><article><h2>Channel distribution</h2><div id="channels" class="bars"></div></article></div><article><h2>Recent parsed signals</h2><div id="recent-signals" class="table-wrap"></div></article></section>
+<section id="notifications" class="view">
+  <article>
+    <div class="toolbar">
+      <div>
+        <h2>Channel message browser</h2>
+        <p class="muted">Stored message history across all five categories. Filter by parsing status to inspect and fix signals needing review.</p>
+      </div>
+      <button class="primary" id="refresh-notifications">Refresh</button>
+    </div>
+    <div class="signal-filters">
+      <label>History size
+        <select id="notification-limit">
+          <option value="50" selected>Last 50 messages — all categories</option>
+          <option value="200">Last 200 messages</option>
+          <option value="500">Last 500 messages</option>
+        </select>
+      </label>
+      <label>Parsing status
+        <select id="notification-parsing-status">
+          <option value="">All statuses</option>
+          <option value="needs_review">Needs Review</option>
+          <option value="parsed">Parsed</option>
+          <option value="manually_corrected">Manually Corrected</option>
+          <option value="unparsed">Unparsed</option>
+        </select>
+      </label>
+      <label>Message type
+        <select id="notification-log-type">
+          <option value="all" selected>All Messages</option>
+          <option value="primary">Primary Only</option>
+          <option value="duplicates">Duplicates</option>
+          <option value="updates">Signal Updates</option>
+        </select>
+      </label>
+      <label>Channel
+        <select id="notification-channel"><option value="">All channels</option></select>
+      </label>
+      <label>Category
+        <select id="notification-category"><option value="">All categories</option></select>
+      </label>
+      <label>From date
+        <input id="notification-date-from" type="date">
+      </label>
+      <label>To date
+        <input id="notification-date-to" type="date">
+      </label>
+      <button id="clear-notification-filters">Clear filters</button>
+      <span id="notification-status" class="muted">Waiting for refresh</span>
+    </div>
+    <div id="notifications-table" class="table-wrap"></div>
+  </article>
+  <article>
+    <h2>Synchronization history</h2>
+    <div id="notification-sync-history" class="table-wrap"></div>
+  </article>
+</section><section id="integrations" class="view"><article><h2>Google Sheets — raw notifications</h2><p class="muted">Apps Script polling with five worksheet mappings, automatic sync, history, and deduplication.</p><form id="sheets-form" class="form-grid"><label>Apps Script Web App URL<input name="apps_script_url" type="url"></label><label>Optional access token<input name="access_token" type="password" placeholder="Leave empty to keep saved token"></label><label>Worksheets<input name="worksheets" value="Crypto, Indian Options, Stock Options, MCX, Forex"></label><label>Sync interval (seconds)<input name="sync_interval_seconds" type="number" min="5" value="30"></label><label>Automatic sync<select name="auto_sync"><option value="true">Enabled</option><option value="false">Disabled</option></select></label><button class="primary">Save Google Sheets</button></form><div class="actions"><button id="sheets-test" type="button">Test connection / sync</button><button id="sheets-history" type="button">Historical import</button></div><output id="sheets-result"></output></article>
+<article><h2>Binance USD-M Futures</h2><p class="muted">Public market data. No API key or secret required.</p><form id="binance-config" class="form-grid"><label>Base URL<input name="base_url" value="https://fapi.binance.com"></label><label>Default symbol<input name="default_symbol" value="BTCUSDT"></label><label>Default timeframe<select name="default_interval"><option>1m</option><option>3m</option><option selected>5m</option><option>15m</option><option>30m</option><option>1h</option><option>2h</option><option>4h</option><option>1d</option></select></label><button class="primary">Save Binance</button></form><button id="binance-test" type="button">Test public connection</button><output id="binance-result"></output></article>
+<article><h2>Twelve Data — Forex</h2><p class="muted">Forex &amp; commodities historical candles (e.g. XAU/USD, WTI/USD) and local cache.</p><form id="twelve-form" class="form-grid"><label>API key<input name="api_key" type="password" placeholder="Leave empty to keep saved key"></label><label>Base URL<input name="base_url" value="https://api.twelvedata.com"></label><label>Default symbols<input name="symbols" value="XAU/USD, WTI/USD, EUR/USD, GBP/USD, USD/JPY"></label><label>Timezone<input name="timezone" value="UTC"></label><button class="primary">Save Twelve Data</button></form><output id="twelve-result"></output></article>
+<article><h2>Angel One SmartAPI</h2><p class="muted">Authentication, official instrument master, token lookup, Indian options and MCX candle retrieval.</p><form id="angel-form" class="form-grid"><label>API key<input name="api_key" type="password"></label><label>Client ID<input name="client_id" type="password"></label><label>Password / PIN<input name="password" type="password"></label><label>TOTP secret<input name="totp_secret" type="password"></label><button class="primary">Save Angel One credentials</button></form><div class="actions"><button id="angel-test" type="button">Authenticate / test session</button><button id="master-refresh" type="button">Refresh official instrument master</button></div><output id="angel-result"></output></article></section>
+<section id="signals" class="view"><article><div class="toolbar"><div><h2>Signals</h2><p class="muted">Tap any signal card to expand raw message, parsed data, multi-entry trade legs, P&amp;L, and OHLC marker chart. Select checkboxes to batch-process or delete.</p></div><button class="primary" id="refresh-signals">Refresh</button></div><div id="category-filters" class="category-filters"></div><div class="signal-filters"><label>Channel<select id="channel-filter"><option value="">All channels</option></select></label><label>Verification / Status<select id="verification-filter"><option value="">All Statuses</option><option value="needs_review">Needs Review (Unparsed)</option><option value="manual_needed">Manual Processing Needed</option><option value="scheduled">Auto-Scheduled (Active)</option><option value="pending">Pending</option><option value="awaiting_market_data">Awaiting Market Data</option><option value="historical_data_missing">No Historical Data</option><option value="entry_hit">Entry Hit</option><option value="target_hit">TP Hit (Target Hit)</option><option value="stop_loss_hit">SL Hit (Stop Loss Hit)</option><option value="ambiguous">Ambiguous</option></select></label><label>Notification type<select id="notification-type-filter"><option value="all">All Notifications</option><option value="primary" selected>Primary Notifications</option><option value="duplicates">Duplicates</option><option value="updates">Signal Updates</option></select></label><button id="clear-signal-filters">Clear filters</button><button id="select-all">Select all</button><button id="select-filtered">Select filtered</button><button id="clear-selection">Clear selection</button><button id="reparse-selected">Re-parse selected</button><button id="delete-selected" class="btn-danger" type="button">Delete selected</button><button class="primary" id="process-selected">Process selected</button></div><output id="process-result"></output><div id="signals-list" class="signals-accordion"></div></article></section>
+<section id="analyzer" class="view"><article><h2>Parse a notification safely</h2><p class="muted">Preview only — no data is saved.</p><textarea id="parse-message" placeholder="XAUUSD SELL NOW 4073&#10;SL 4082&#10;TP 4065 4058"></textarea><button class="primary" id="parse-preview">Analyze message</button><pre id="parse-output"></pre></article></section>
+<section id="analytics" class="view"><article><h2>Channel analytics &amp; P&amp;L</h2><p class="muted">Per-channel signal counts, today's TP/SL hits, triggered entry legs, and realized profit/loss in INR (₹) and USD ($).</p><div id="analytics-table" class="table-wrap"></div></article></section>
+<section id="market" class="view">
+  <article>
+    <div class="toolbar">
+      <div>
+        <h2>Historical candle download</h2>
+        <p class="muted">Select active F&amp;O / MCX contracts with valid expiries, or Forex / Commodity &amp; Crypto symbols.</p>
+      </div>
+      <button type="button" id="market-master-refresh">Refresh Angel One Master</button>
+    </div>
+    <form id="candle-form" class="form-grid">
+      <label>Provider
+        <select name="provider" id="candle-provider">
+          <option value="angel_one">Angel One (Indian F&amp;O &amp; MCX)</option>
+          <option value="twelve_data">Twelve Data (Forex &amp; Gold / US Oil)</option>
+          <option value="binance">Binance USD-M Futures (Crypto)</option>
+        </select>
+      </label>
+      <label class="ao-field">Category / Segment
+        <select id="ao-category">
+          <option value="NFO|FUTIDX">Index Futures (NFO — NIFTY / BANKNIFTY)</option>
+          <option value="NFO|OPTIDX">Index Options (NFO — CE / PE)</option>
+          <option value="NFO|FUTSTK">Stock Futures (NFO)</option>
+          <option value="NFO|OPTSTK">Stock Options (NFO)</option>
+          <option value="MCX|FUTCOM">MCX Commodity Futures (CRUDEOIL / GOLD / SILVER)</option>
+          <option value="MCX|OPTFUT">MCX Commodity Options (CE / PE)</option>
+          <option value="BFO|FUTIDX">BSE Index Futures (BFO — SENSEX)</option>
+          <option value="BFO|OPTIDX">BSE Index Options (BFO — SENSEX)</option>
+          <option value="NSE|AMXIDX">NSE Spot Indices (NIFTY 50 / BANKNIFTY)</option>
+        </select>
+      </label>
+      <label class="ao-field">Underlying
+        <select id="ao-underlying"><option value="">Loading...</option></select>
+      </label>
+      <label class="ao-field">Expiry Date
+        <select id="ao-expiry"><option value="">Loading...</option></select>
+      </label>
+      <label class="ao-field">Filter Strike / Option (optional)
+        <input id="ao-filter" placeholder="e.g. 24500 or CE or PE">
+      </label>
+      <label class="ao-field">Active Contract / Symbol
+        <select id="ao-contract"><option value="">Loading...</option></select>
+      </label>
+      <label class="td-field" style="display:none">Forex / Commodity Symbol
+        <select id="td-symbol">
+          <optgroup label="Commodities &amp; Metals">
+            <option value="XAU/USD">XAU/USD — Gold / US Dollar (XAUUSD)</option>
+            <option value="WTI/USD">WTI/USD — US Oil / WTI Crude Spot (USOIL)</option>
+            <option value="XBR/USD">XBR/USD — UK Oil / Brent Crude Spot</option>
+            <option value="XAG/USD">XAG/USD — Silver / US Dollar (XAGUSD)</option>
+          </optgroup>
+          <optgroup label="Major Forex Pairs">
+            <option value="EUR/USD">EUR/USD — Euro / US Dollar</option>
+            <option value="GBP/USD">GBP/USD — British Pound / US Dollar</option>
+            <option value="USD/JPY">USD/JPY — US Dollar / Japanese Yen</option>
+            <option value="AUD/USD">AUD/USD — Australian Dollar / US Dollar</option>
+            <option value="USD/CAD">USD/CAD — US Dollar / Canadian Dollar</option>
+            <option value="USD/CHF">USD/CHF — US Dollar / Swiss Franc</option>
+            <option value="NZD/USD">NZD/USD — New Zealand Dollar / US Dollar</option>
+          </optgroup>
+          <optgroup label="Saved Custom Symbols" id="td-custom-group"></optgroup>
+        </select>
+      </label>
+      <label class="bn-field" style="display:none">USDT-M Futures Symbol
+        <select id="bn-symbol">
+          <option value="BTCUSDT">BTCUSDT — Bitcoin Perpetual</option>
+          <option value="ETHUSDT">ETHUSDT — Ethereum Perpetual</option>
+          <option value="SOLUSDT">SOLUSDT — Solana Perpetual</option>
+          <option value="BNBUSDT">BNBUSDT — BNB Perpetual</option>
+          <option value="XRPUSDT">XRPUSDT — XRP Perpetual</option>
+          <option value="DOGEUSDT">DOGEUSDT — Dogecoin Perpetual</option>
+          <option value="ADAUSDT">ADAUSDT — Cardano Perpetual</option>
+          <option value="AVAXUSDT">AVAXUSDT — Avalanche Perpetual</option>
+          <option value="LINKUSDT">LINKUSDT — Chainlink Perpetual</option>
+          <option value="SUIUSDT">SUIUSDT — Sui Perpetual</option>
+        </select>
+      </label>
+      <label>Interval
+        <select name="interval" id="candle-interval"></select>
+      </label>
+      <label>Start
+        <input name="start" type="datetime-local">
+      </label>
+      <label>End
+        <input name="end" type="datetime-local">
+      </label>
+      <input type="hidden" name="symbol" id="resolved-symbol">
+      <input type="hidden" name="exchange" id="resolved-exchange">
+      <button class="primary">Download range</button>
+    </form>
+    <p id="resolved-preview" class="muted" style="margin-top:10px;font-size:12px;"></p>
+    <output id="candle-result"></output>
+    <output id="twelve-usage"></output>
+  </article>
+  <article><h2>Local candle cache coverage</h2><div id="coverage" class="table-wrap"></div></article>
+  <article><h2>Angel One instrument search</h2><form id="instrument-form" class="form-grid"><label>Symbol or token<input name="q"></label><label>Exchange segment<input name="exchange" placeholder="NFO"></label><button>Search instrument master</button></form><div id="instruments" class="table-wrap"></div></article>
+</section>
+<section id="reports" class="view"><article><h2>Reports &amp; export</h2><div class="actions"><a href="/api/export/raw.csv">Raw notifications CSV</a><a href="/api/export/signals.csv">Signals CSV</a><a href="/api/export/channels.csv">Channel report CSV</a><button id="backup">Create local backup</button></div><output id="backup-result"></output></article></section>
+<section id="settings" class="view">
+  <article>
+    <h2>Application settings</h2>
+    <form id="settings-form" class="form-grid">
+      <label>Timezone<input name="timezone"></label>
+      <label>Sync interval (seconds)<input name="sync_interval_seconds" type="number" min="5"></label>
+      <label>Duplicate window (minutes)<input name="duplicate_window_minutes" type="number" min="1" value="10"></label>
+      <label>Initial verification wait (minutes)<input name="verification_initial_wait_minutes" type="number" min="0" value="15"></label>
+      <label>Repeat verification interval (minutes)<input name="verification_repeat_minutes" type="number" min="1" value="15"></label>
+      <label>Verification timeframe<input name="verification_timeframe" value="1m"></label>
+      <label>Signal expiry (hours)<input name="verification_expiry_hours" type="number" min="1" value="168"></label>
+      <label>Automatic verification<select name="automatic_verification_enabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></label>
+      <label>Missing-candle retry (minutes)<input name="verification_retry_minutes" type="number" min="1" value="15"></label>
+      <label>Default timeframe<input name="default_timeframe"></label>
+      <label>Entry tolerance<input name="entry_tolerance" type="number" step="any"></label>
+      <button class="primary">Save settings</button>
+    </form>
+  </article>
+
+  <article>
+    <div class="toolbar">
+      <div>
+        <h2>Default SL, Targets (TP1–TP3) &amp; Position Sizing</h2>
+        <p class="muted">Set category fallbacks and per-symbol overrides for SL, TP1–TP3, Lots &amp; Lot Size (Options, MCX, Forex), or USD ($) capital per trade (Crypto). Explicit signal values are never overwritten.</p>
+      </div>
+      <div class="actions">
+        <button type="button" id="apply-default-sl-existing">Apply missing SL &amp; TPs to existing</button>
+        <button type="button" class="primary" id="save-default-sl">Save Rules</button>
+      </div>
+    </div>
+    <output id="default-sl-result"></output>
+    <div id="default-sl-categories" class="sl-categories-stack"></div>
+  </article>
+</section>
+<section id="logs" class="view"><article><h2>System logs</h2><div id="logs-table" class="table-wrap"></div></article></section></main>
+<dialog id="parse-review-dialog"><div class="toolbar"><h2>Parsed signal review</h2><button id="close-parse-review" type="button">Close</button></div><div id="parse-review"><p class="muted">Loading...</p></div></dialog>
+<script>{{ inline_js|safe }}</script><script>document.querySelectorAll('nav button').forEach(function(b){b.addEventListener('click',function(){document.querySelectorAll('nav button,.view').forEach(function(x){x.classList.remove('active')});b.classList.add('active');var view=document.getElementById(b.dataset.view);if(view)view.classList.add('active')})});</script></body></html>

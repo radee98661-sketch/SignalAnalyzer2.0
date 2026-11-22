@@ -1,0 +1,6 @@
+{
+  "name": "Signal Analyzer",
+  "description": "Local-first Android trading signal parser, OHLC candle verifier, multi-leg P&L tracker, and authenticated LAN browser dashboard.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

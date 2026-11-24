@@ -1187,20 +1187,24 @@ class SignalRepository(
 
         val sql = buildString {
             append(
-                "SELECT COALESCE(NULLIF(TRIM(r.channel),''), 'Unknown') AS channel, " +
+                "SELECT agg.channel, agg.category, agg.total_messages, agg.today_messages, " +
+                    "agg.parsed_count, agg.needs_review_count, " +
+                    "r2.message AS last_message, agg.last_time, agg.last_raw_id " +
+                    "FROM (" +
+                    "SELECT COALESCE(NULLIF(TRIM(r.channel),''), 'Unknown') AS channel, " +
                     "COALESCE(NULLIF(TRIM(r.category),''), 'Uncategorized') AS category, " +
                     "COUNT(DISTINCT r.id) AS total_messages, " +
                     "COUNT(DISTINCT CASE WHEN substr(COALESCE(r.notification_time, r.received_at), 1, 10) = ? THEN r.id END) AS today_messages, " +
                     "COUNT(DISTINCT CASE WHEN s.parsing_status IN ('parsed','manually_corrected') THEN r.id END) AS parsed_count, " +
                     "COUNT(DISTINCT CASE WHEN s.parsing_status = 'needs_review' OR s.manual_review_status = 'required' THEN r.id END) AS needs_review_count, " +
-                    "(SELECT r2.message FROM raw_notifications r2 WHERE r2.id = MAX(r.id)) AS last_message, " +
                     "MAX(COALESCE(r.notification_time, r.received_at)) AS last_time, " +
                     "MAX(r.id) AS last_raw_id " +
                     "FROM raw_notifications r LEFT JOIN signals s ON s.raw_notification_id = r.id"
             )
             if (where.isNotEmpty()) append(" WHERE ").append(where.joinToString(" AND "))
-            append(" GROUP BY COALESCE(NULLIF(TRIM(r.channel),''), 'Unknown'), COALESCE(NULLIF(TRIM(r.category),''), 'Uncategorized') ")
-            append(" ORDER BY last_time DESC, last_raw_id DESC")
+            append(" GROUP BY COALESCE(NULLIF(TRIM(r.channel),''), 'Unknown'), COALESCE(NULLIF(TRIM(r.category),''), 'Uncategorized')")
+            append(") agg LEFT JOIN raw_notifications r2 ON r2.id = agg.last_raw_id ")
+            append("ORDER BY agg.last_time DESC, agg.last_raw_id DESC")
         }
 
         val rawRows = core.queryInboxChannelSummaries(SimpleSQLiteQuery(sql, args.toTypedArray()))

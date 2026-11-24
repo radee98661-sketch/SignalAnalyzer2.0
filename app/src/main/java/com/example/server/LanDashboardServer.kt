@@ -340,64 +340,72 @@ class LanDashboardServer(
 
         get("/inbox/channels") {
             if (!call.requireAuth()) return@get
-            val category = call.request.queryParameters["category"].orEmpty()
-            val allChannels = repository.getInboxChannels(category = "")
-            val catCounts = linkedMapOf<String, Int>()
-            SourceNotificationRow.DEFAULT_CATEGORIES.forEach { catCounts[it] = 0 }
-            allChannels.forEach { ch ->
-                catCounts[ch.category] = (catCounts[ch.category] ?: 0) + ch.totalMessages
-            }
-            val filtered = if (category.isBlank()) {
-                allChannels
-            } else {
-                val canon = SignalRepository.canonicalCategory(category)
-                allChannels.filter { it.category.equals(canon, ignoreCase = true) }
-            }
-            call.respondJson(
-                JSONObject().apply {
-                    put("selected_category", if (category.isBlank()) "" else SignalRepository.canonicalCategory(category))
-                    put("categories", JSONArray(catCounts.entries.map { JSONObject(mapOf("name" to it.key, "value" to it.value)) }))
-                    put("channels", JSONArray(filtered.map { ch ->
-                        JSONObject().apply {
-                            put("channel", ch.channel)
-                            put("category", ch.category)
-                            put("total_messages", ch.totalMessages)
-                            put("today_messages", ch.todayMessages)
-                            put("parsed_count", ch.parsedCount)
-                            put("needs_review_count", ch.needsReviewCount)
-                            put("last_message", ch.lastMessage)
-                            put("last_time", ch.lastTime)
-                            put("last_raw_id", ch.lastRawId)
-                        }
-                    }))
+            try {
+                val category = call.request.queryParameters["category"].orEmpty()
+                val allChannels = repository.getInboxChannels(category = "")
+                val catCounts = linkedMapOf<String, Int>()
+                SourceNotificationRow.DEFAULT_CATEGORIES.forEach { catCounts[it] = 0 }
+                allChannels.forEach { ch ->
+                    catCounts[ch.category] = (catCounts[ch.category] ?: 0) + ch.totalMessages
                 }
-            )
+                val filtered = if (category.isBlank()) {
+                    allChannels
+                } else {
+                    val canon = SignalRepository.canonicalCategory(category)
+                    allChannels.filter { it.category.equals(canon, ignoreCase = true) }
+                }
+                call.respondJson(
+                    JSONObject().apply {
+                        put("selected_category", if (category.isBlank()) "" else SignalRepository.canonicalCategory(category))
+                        put("categories", JSONArray(catCounts.entries.map { JSONObject(mapOf("name" to it.key, "value" to it.value)) }))
+                        put("channels", JSONArray(filtered.map { ch ->
+                            JSONObject().apply {
+                                put("channel", ch.channel)
+                                put("category", ch.category)
+                                put("total_messages", ch.totalMessages)
+                                put("today_messages", ch.todayMessages)
+                                put("parsed_count", ch.parsedCount)
+                                put("needs_review_count", ch.needsReviewCount)
+                                put("last_message", ch.lastMessage)
+                                put("last_time", ch.lastTime)
+                                put("last_raw_id", ch.lastRawId)
+                            }
+                        }))
+                    }
+                )
+            } catch (e: Exception) {
+                call.respondJsonError(HttpStatusCode.InternalServerError, e.message ?: "Failed to load inbox channels")
+            }
         }
 
         get("/inbox/messages") {
             if (!call.requireAuth()) return@get
-            val qp = call.request.queryParameters
-            val channel = qp["channel"].orEmpty()
-            if (channel.isBlank()) {
-                return@get call.respondJsonError(HttpStatusCode.BadRequest, "channel query parameter is required.")
-            }
-            val history = repository.getInboxMessages(
-                channel = channel,
-                category = qp["category"].orEmpty(),
-                search = qp["search"].orEmpty(),
-                limit = qp["limit"]?.toIntOrNull() ?: 200
-            )
-            call.respondJson(
-                JSONObject().apply {
-                    put("channel", history.channel)
-                    put("category", history.category)
-                    put("total_count", history.totalCount)
-                    put("parsed_count", history.parsedCount)
-                    put("needs_review_count", history.needsReviewCount)
-                    put("has_more", history.hasMore)
-                    put("messages", JSONArray(history.messages.map { notifJoinedToJson(it) }))
+            try {
+                val qp = call.request.queryParameters
+                val channel = qp["channel"].orEmpty()
+                if (channel.isBlank()) {
+                    return@get call.respondJsonError(HttpStatusCode.BadRequest, "channel query parameter is required.")
                 }
-            )
+                val history = repository.getInboxMessages(
+                    channel = channel,
+                    category = qp["category"].orEmpty(),
+                    search = qp["search"].orEmpty(),
+                    limit = qp["limit"]?.toIntOrNull() ?: 200
+                )
+                call.respondJson(
+                    JSONObject().apply {
+                        put("channel", history.channel)
+                        put("category", history.category)
+                        put("total_count", history.totalCount)
+                        put("parsed_count", history.parsedCount)
+                        put("needs_review_count", history.needsReviewCount)
+                        put("has_more", history.hasMore)
+                        put("messages", JSONArray(history.messages.map { notifJoinedToJson(it) }))
+                    }
+                )
+            } catch (e: Exception) {
+                call.respondJsonError(HttpStatusCode.InternalServerError, e.message ?: "Failed to load channel messages")
+            }
         }
 
         get("/signals") {

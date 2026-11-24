@@ -1417,32 +1417,39 @@ function renderInboxChannelList() {
 }
 
 async function loadInboxChannels(preserveSelection = true) {
-  const qs = inboxState.category ? '?category=' + encodeURIComponent(inboxState.category) : '';
-  const data = await api('/api/v1/inbox/channels' + qs);
-  inboxState.categories = data.categories || [];
-  inboxState.channels = data.channels || [];
-  renderInboxCategoryPills();
+  const listHost = $('#inbox-channel-list');
+  try {
+    const qs = inboxState.category ? '?category=' + encodeURIComponent(inboxState.category) : '';
+    const data = await api('/api/v1/inbox/channels' + qs);
+    inboxState.categories = data.categories || [];
+    inboxState.channels = data.channels || [];
+    renderInboxCategoryPills();
 
-  if (preserveSelection && inboxState.selectedChannel) {
-    const stillExists = inboxState.channels.some(c =>
-      c.channel === inboxState.selectedChannel.channel && c.category === inboxState.selectedChannel.category
-    );
-    if (!stillExists) inboxState.selectedChannel = null;
-  }
-  if (!inboxState.selectedChannel && inboxState.channels.length && window.innerWidth > 760) {
-    const first = inboxState.channels[0];
-    inboxState.selectedChannel = { channel: first.channel, category: first.category };
-    renderInboxChannelList();
-    await loadInboxMessages(true);
-    return;
-  }
-  renderInboxChannelList();
-  if (!inboxState.selectedChannel) {
-    if ($('#inbox-chat-header')) {
-      $('#inbox-chat-header').innerHTML = '<div class="inbox-chat-empty-head"><span class="muted">Select a channel to open message history</span></div>';
+    if (preserveSelection && inboxState.selectedChannel) {
+      const stillExists = inboxState.channels.some(c =>
+        c.channel === inboxState.selectedChannel.channel && c.category === inboxState.selectedChannel.category
+      );
+      if (!stillExists) inboxState.selectedChannel = null;
     }
-    if ($('#inbox-messages')) {
-      $('#inbox-messages').innerHTML = '<div class="inbox-empty-state"><div class="inbox-empty-icon">&#128172;</div><h3>Telegram-Style Channel Inbox</h3><p class="muted">Pick any category and channel on the left to inspect every received signal, copy raw text in one click, and cross-check the Parsed Summary box.</p></div>';
+    if (!inboxState.selectedChannel && inboxState.channels.length && window.innerWidth > 760) {
+      const first = inboxState.channels[0];
+      inboxState.selectedChannel = { channel: first.channel, category: first.category };
+      renderInboxChannelList();
+      await loadInboxMessages(true);
+      return;
+    }
+    renderInboxChannelList();
+    if (!inboxState.selectedChannel) {
+      if ($('#inbox-chat-header')) {
+        $('#inbox-chat-header').innerHTML = '<div class="inbox-chat-empty-head"><span class="muted">Select a channel to open message history</span></div>';
+      }
+      if ($('#inbox-messages')) {
+        $('#inbox-messages').innerHTML = '<div class="inbox-empty-state"><div class="inbox-empty-icon">&#128172;</div><h3>Telegram-Style Channel Inbox</h3><p class="muted">Pick any category and channel on the left to inspect every received signal, copy raw text in one click, and cross-check the Parsed Summary box.</p></div>';
+      }
+    }
+  } catch (e) {
+    if (listHost) {
+      listHost.innerHTML = `<p class="red" style="padding:14px;font-size:12px">Failed to load channels: ${esc(e.message || String(e))}</p>`;
     }
   }
 }
@@ -1460,7 +1467,13 @@ async function loadInboxMessages(scrollToBottom = false) {
   });
   if (inboxState.messageSearch.trim()) q.set('search', inboxState.messageSearch.trim());
 
-  const data = await api('/api/v1/inbox/messages?' + q);
+  let data;
+  try {
+    data = await api('/api/v1/inbox/messages?' + q);
+  } catch (e) {
+    msgHost.innerHTML = `<div class="inbox-empty-state"><p class="red">Failed to load messages: ${esc(e.message || String(e))}</p></div>`;
+    return;
+  }
   inboxState.lastHistory = data;
   const msgs = data.messages || [];
   inboxState.rawMessagesById.clear();

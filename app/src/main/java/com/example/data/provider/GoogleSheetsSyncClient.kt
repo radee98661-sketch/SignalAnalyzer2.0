@@ -54,6 +54,7 @@ class GoogleSheetsSyncClient(
         )
 
         var imported = 0
+        var updated = 0
         var duplicates = 0
         var skipped = 0
         var failed = 0
@@ -84,9 +85,19 @@ class GoogleSheetsSyncClient(
                 throw IllegalArgumentException("Apps Script URL must use HTTPS.")
             }
 
+            val savedCursor = core.getSetting("google_sheets_next_since_ms")?.trim().orEmpty()
+            val effectiveSinceMs = savedCursor.toLongOrNull()?.let { ms ->
+                (ms - EDIT_LOOKBACK_MS).coerceAtLeast(0L).toString()
+            } ?: savedCursor
+            val requestUrl = if (effectiveSinceMs.isNotEmpty() && parsedUrl.queryParameter("since_ms") == null) {
+                parsedUrl.newBuilder().addQueryParameter("since_ms", effectiveSinceMs).build()
+            } else {
+                parsedUrl
+            }
+
             val token = secretStore.getProviderSecrets("google_sheets")["access_token"].orEmpty()
             val reqBuilder = Request.Builder()
-                .url(parsedUrl)
+                .url(requestUrl)
                 .header("User-Agent", "SignalAnalyzer/1.0")
                 .get()
             if (token.isNotBlank()) {
@@ -179,8 +190,14 @@ class GoogleSheetsSyncClient(
                     try {
                         val row = SourceNotificationRow.fromMap(translated)
                         val (_, resStatus) = ingestionService.ingest(row)
-                        if (resStatus == "imported") imported++
-                        else if (resStatus == "duplicate") duplicates++
+                        when (resStatus) {
+                            "imported" -> imported++
+                            "updated" -> {
+                                imported++
+                                updated++
+                            }
+                            "duplicate" -> duplicates++
+                        }
                     } catch (_: Exception) {
                         failed++
                     }
@@ -193,7 +210,8 @@ class GoogleSheetsSyncClient(
                 )
             }
             status = "success"
-            detail = "Completed $sourceFormat import." +
+            val editNote = if (updated > 0) " Updated $updated edited message(s)." else ""
+            detail = "Completed $sourceFormat import.$editNote" +
                 if (endpointCursor != null) " Endpoint cursor saved: $endpointCursor." else ""
         } catch (e: Exception) {
             status = "failed"
@@ -240,6 +258,9 @@ class GoogleSheetsSyncClient(
     }
 
     companion object {
+        // 2-hour overlap lookback so messages edited in Telegram after initial import are always re-fetched
+        const val EDIT_LOOKBACK_MS: Long = 2L * 60L * 60L * 1000L
+
         val APPS_SCRIPT_COLUMNS: Map<String, String> = linkedMapOf(
             "Received At" to "received_at",
             "Notification Time" to "notification_time",

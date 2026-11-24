@@ -10,11 +10,15 @@ object SignalParser {
 
     private fun stripLeverageNoise(text: String): String {
         var cleaned = Regex(
-            "(?:leverage|lev)?\\s*[:\\-]?\\s*(?:cross|isolated)?\\s*\\d+(?:\\.\\d+)?\\s*[x×X](?:\\s*[\\-/,to]+\\s*\\d+(?:\\.\\d+)?\\s*[x×X])*",
+            "(?:leverage|lev)?\\s*[:\\-]?\\s*(?:cross|isolated)?\\s*\\(?\\s*\\d+(?:\\.\\d+)?\\s*[x×X]?(?:\\s*(?:-|/|to|[ \\t]+)\\s*\\d+(?:\\.\\d+)?\\s*[x×X])+\\s*\\)?",
             RegexOption.IGNORE_CASE
         ).replace(text, " ")
-        cleaned = Regex("\\b(?:cross|isolated)\\s*\\d+(?:\\.\\d+)?\\s*[x×X]?\\b", RegexOption.IGNORE_CASE).replace(cleaned, " ")
-        cleaned = Regex("\\b\\d+(?:\\.\\d+)?\\s*[x×X]\\b", RegexOption.IGNORE_CASE).replace(cleaned, " ")
+        cleaned = Regex(
+            "(?:leverage|lev)?\\s*[:\\-]?\\s*(?:cross|isolated)?\\s*\\(?\\s*\\d+(?:\\.\\d+)?\\s*[x×X]\\s*\\)?",
+            RegexOption.IGNORE_CASE
+        ).replace(cleaned, " ")
+        cleaned = Regex("\\b(?:cross|isolated)\\s*\\(?\\s*\\d+(?:\\.\\d+)?\\s*[x×X]?\\s*\\)?", RegexOption.IGNORE_CASE).replace(cleaned, " ")
+        cleaned = Regex("\\(?\\b\\d+(?:\\.\\d+)?\\s*[x×X]\\b\\)?", RegexOption.IGNORE_CASE).replace(cleaned, " ")
         return cleaned
     }
 
@@ -43,8 +47,10 @@ object SignalParser {
         for (line in blockText.lines()) {
             var cleanLine = line.trim()
             if (cleanLine.isEmpty()) continue
+            cleanLine = Regex("\\b\\d+(?:\\.\\d+)?(?:\\s*(?:-|to|/)\\s*\\d+(?:\\.\\d+)?)?\\s*%", RegexOption.IGNORE_CASE)
+                .replace(cleanLine, " ")
             cleanLine = Regex(
-                "^(?:take\\s+profit\\s+targets?|take\\s+profit|targets?|tps?|t)\\s*(?:\\d+(?:st|nd|rd|th)?|1st|2nd|3rd|4th|5th)?\\s*[:\\-]?\\s*",
+                "^(?:take[\\s\\-]+profit[\\s\\-]+targets?|take[\\s\\-]+profit|entry[\\s\\-]+targets?|targets?|tps?|t)\\s*(?:\\d+(?:st|nd|rd|th)?|1st|2nd|3rd|4th|5th)?\\s*[:\\-]?\\s*",
                 RegexOption.IGNORE_CASE
             ).replace(cleanLine, "")
             cleanLine = Regex("(?:^|\\s)\\d{1,2}\\s*\\)\\s*").replace(cleanLine, " ")
@@ -53,11 +59,18 @@ object SignalParser {
                 "\\b(?:tp|target)\\s*(?:\\d+(?:st|nd|rd|th)?|1st|2nd|3rd|4th|5th)\\s*[:\\-]?\\s*",
                 RegexOption.IGNORE_CASE
             ).replace(cleanLine, " ")
-            for (num in extractCleanNumbers(cleanLine)) {
-                if (num !in targets) targets += num
+            for (num in HybridOptionsParser.extractNumbers(cleanLine)) {
+                if (num > 0.0 && num !in targets) targets += num
             }
         }
         return HybridOptionsParser.cleanTargets(targets)
+    }
+
+    private const val SECTION_BREAK = "__SECTION_BREAK__"
+
+    private fun replaceSpanWithBreak(text: String, start: Int, endExclusive: Int): String {
+        if (start < 0 || endExclusive > text.length || start >= endExclusive) return text
+        return text.substring(0, start) + "\n$SECTION_BREAK\n" + text.substring(endExclusive)
     }
 
     fun parseSingleCryptoBlock(
@@ -65,16 +78,30 @@ object SignalParser {
         category: String = "Crypto",
         slRules: Map<String, DefaultSlCategoryRule>? = null
     ): ParsedSignal {
-        val raw = HybridOptionsParser.normalizeText(rawBlock)
-        val cleaned = stripLeverageNoise(raw)
+        var raw = HybridOptionsParser.normalizeText(rawBlock)
+        raw = Regex("[→➔➜➤➡⇒]+|->").replace(raw, " ")
+        var cleaned = stripLeverageNoise(raw)
+        // Strip Trailing Configuration section (e.g. "Trailing Configuration:\nStop: Breakeven -\nTrigger: Target (1)")
+        cleaned = Regex(
+            "\\btrailing\\s+configuration\\b[\\s\\S]*?(?=\\n\\s*\\n|\\n[ \\t]*(?:entry|take[\\s\\-]*profit|stop[\\s\\-]*target|stop[\\s\\-]*loss|sl\\b)|$)",
+            RegexOption.IGNORE_CASE
+        ).replace(cleaned, "\n$SECTION_BREAK\n")
+        // Strip risk/usage/amount percentage noise & Telegram handles so digits inside them never leak as prices
+        cleaned = Regex(
+            "\\b(?:account[\\s\\-]*usage|amount|margin|wallet|capital|risk[\\s\\-]*size|position[\\s\\-]*size)\\b[ \\t:=\\-]*\\d+(?:\\.\\d+)?(?:\\s*(?:-|to|/)\\s*\\d+(?:\\.\\d+)?)?\\s*%?",
+            RegexOption.IGNORE_CASE
+        ).replace(cleaned, "\n$SECTION_BREAK\n")
+        cleaned = Regex("\\b\\d+(?:\\.\\d+)?(?:\\s*(?:-|to|/)\\s*\\d+(?:\\.\\d+)?)?\\s*%", RegexOption.IGNORE_CASE)
+            .replace(cleaned, " ")
+        cleaned = Regex("@[A-Za-z_][A-Za-z0-9_]*").replace(cleaned, " ")
 
         var symbol: String? = null
-        val mPair = Regex("#?([A-Z0-9]{2,15})\\s*/\\s*(USDT|USDC|BUSD)\\b", RegexOption.IGNORE_CASE).find(cleaned)
+        val mPair = Regex("[#$]?([A-Z0-9]{2,15})\\s*/\\s*(USDT|USDC|BUSD)\\b", RegexOption.IGNORE_CASE).find(cleaned)
         if (mPair != null) {
             symbol = "${mPair.groupValues[1].uppercase(Locale.US)}${mPair.groupValues[2].uppercase(Locale.US)}"
         }
         if (symbol == null) {
-            val mHash = Regex("#([A-Z0-9]{2,15})(?=[.\\s,:;\\-]|$)", RegexOption.IGNORE_CASE).find(cleaned)
+            val mHash = Regex("[#$]([A-Z0-9]*[A-Z][A-Z0-9]{1,14})(?=[.\\s,:;\\-]|$)", RegexOption.IGNORE_CASE).find(cleaned)
             if (mHash != null) {
                 val base = mHash.groupValues[1].uppercase(Locale.US)
                 symbol = if (base.endsWith("USDT") || base.endsWith("USDC") || base.endsWith("BUSD")) base else "${base}USDT"
@@ -91,68 +118,145 @@ object SignalParser {
             else -> null
         }
 
+        var working = cleaned
+
+        // 1. Extract & mask Stop-Loss / Stop Target FIRST so SL prices & headers never leak into Entry or Targets
+        var stopLoss: Double? = null
+        val mSl = Regex(
+            "\\b(?:stop[\\s\\-]*loss(?:es)?|stoploss|stop[\\s\\-]*targets?|s/l|sl)\\b[ \\t:=\\-]*(?:\\n[ \\t]*){0,3}(?:\\d{1,2}\\s*\\)[ \\t]*|\\d{1,2}[.:\\-][ \\t]+)?([0-9,]+(?:\\.[0-9]+)?)",
+            RegexOption.IGNORE_CASE
+        ).find(working)
+        if (mSl != null) {
+            stopLoss = HybridOptionsParser.parseNumber(mSl.groupValues[1])
+            working = replaceSpanWithBreak(working, mSl.range.first, mSl.range.last + 1)
+        }
+
+        // 2. Extract & mask Entry section (supports single-line, range, market_now, and multi-line Entry Targets blocks)
         var entryPrice: Double? = null
         var additionalEntries: List<Double> = emptyList()
         var entryMode = "limit"
 
         val mEntryLine = Regex(
-            "(?:take\\s+entry\\s+now|take\\s+entry|entries|entry\\s*zone|entry\\s*price|entry|buy\\s+at|sell\\s+at|cmp)[ \\t]*[:\\-]?[ \\t]*([^\\n]+)",
+            "\\b(?:take\\s+entry\\s+now|take\\s+entry|entry[\\s\\-]*targets?|entries|entrys|entry[\\s\\-]*zone|entry[\\s\\-]*price|1st[\\s\\-]*entry|entry[\\s\\-]*1|entry|enter|buy\\s+at|sell\\s+at|long\\s+at|short\\s+at|cmp)\\b[ \\t:=\\-]*([^\\n]*?)(?=\\b(?:take[\\s\\-]*profit|targets?|tps?|tp\\d+|stop[\\s\\-]*loss|stoploss|stop[\\s\\-]*targets?|sl|s/l|$SECTION_BREAK)\\b|\\n|$)",
             RegexOption.IGNORE_CASE
-        ).find(cleaned)
+        ).find(working)
         if (mEntryLine != null) {
             val entrySeg = mEntryLine.groupValues[1].trim()
             val nums = extractCleanNumbers(entrySeg)
             if (nums.isNotEmpty()) {
                 entryPrice = nums[0]
                 additionalEntries = nums.drop(1)
-            } else if (Regex("\\b(?:now|market|cmp)\\b", RegexOption.IGNORE_CASE).containsMatchIn(entrySeg)) {
+                working = replaceSpanWithBreak(working, mEntryLine.range.first, mEntryLine.range.last + 1)
+            } else if (HybridOptionsParser.MARKET_NOW_SEGMENT_RE.containsMatchIn(entrySeg) ||
+                Regex("\\b(?:take\\s+entry\\s+now|cmp)\\b", RegexOption.IGNORE_CASE).containsMatchIn(mEntryLine.value)
+            ) {
                 entryMode = "market_now"
+                working = replaceSpanWithBreak(working, mEntryLine.range.first, mEntryLine.range.last + 1)
+            } else {
+                // Multi-line entry block (e.g., "Entry Targets:\n\n1) 3.44\n\n2) 3.35" or "Entry Targets:\n1) Market")
+                val afterIdx = mEntryLine.range.last + 1
+                val afterEntry = working.substring(afterIdx)
+                val mEntryBody = Regex(
+                    "^([\\s\\S]*?)(?=\\n[ \\t]*(?:take[\\s\\-]*profit|targets?\\b|tps?\\b|tp\\s*\\d|stop[\\s\\-]*loss|stoploss|stop[\\s\\-]*targets?|sl\\b|s/l\\b|leverage\\b|lev\\b|trailing\\b|account\\b|amount\\b|margin\\b|published\\b|manage\\b|no\\s*reacts\\b|note\\b|$SECTION_BREAK)|$)",
+                    RegexOption.IGNORE_CASE
+                ).find(afterEntry)
+                val bodyText = mEntryBody?.groupValues?.get(1).orEmpty()
+                val bodyNums = extractTargetsFromBlock(bodyText)
+                if (bodyNums.isNotEmpty()) {
+                    entryPrice = bodyNums[0]
+                    additionalEntries = bodyNums.drop(1)
+                    val endIdx = afterIdx + (mEntryBody?.range?.last?.plus(1) ?: 0)
+                    working = replaceSpanWithBreak(working, mEntryLine.range.first, endIdx)
+                } else if (HybridOptionsParser.MARKET_NOW_SEGMENT_RE.containsMatchIn(bodyText)) {
+                    entryMode = "market_now"
+                    val endIdx = afterIdx + (mEntryBody?.range?.last?.plus(1) ?: 0)
+                    working = replaceSpanWithBreak(working, mEntryLine.range.first, endIdx)
+                } else {
+                    // Still mask the Entry header so "Entry Targets" cannot match the Targets section below
+                    working = replaceSpanWithBreak(working, mEntryLine.range.first, mEntryLine.range.last + 1)
+                }
             }
         }
 
+        // Capture secondary entry lines (e.g., "2nd ENTRY: 0.2250", "3rd Entry: 0.21", "Entry 2: 0.225", "DCA: 0.22")
+        val secondaryEntryRe = Regex(
+            "\\b(?:(?:2nd|3rd|4th|second|third|add(?:itional)?|extra)[ \\t]+(?:entry[\\s\\-]*(?:price|zone|level)?|entries|entrys|buy|sell)|(?:dca|re[\\s\\-]?entry)(?:[ \\t]+(?:entry|price|zone|level))?|entry[\\s\\-]*(?:2|3|4|two|three))\\b[ \\t:=\\-]*([^\\n]*?)(?=\\b(?:take[\\s\\-]*profit|targets?|tps?|tp\\d+|stop[\\s\\-]*loss|stoploss|stop[\\s\\-]*targets?|sl|s/l|$SECTION_BREAK)\\b|\\n|$)",
+            RegexOption.IGNORE_CASE
+        )
+        val extraEntriesMutable = additionalEntries.toMutableList()
+        while (true) {
+            val mExtra = secondaryEntryRe.find(working) ?: break
+            val extraNums = extractCleanNumbers(mExtra.groupValues[1])
+            for (n in extraNums) {
+                if (entryPrice == null) {
+                    entryPrice = n
+                } else if (abs(n - entryPrice) > 1e-9 && extraEntriesMutable.none { abs(it - n) <= 1e-9 }) {
+                    extraEntriesMutable += n
+                }
+            }
+            working = replaceSpanWithBreak(working, mExtra.range.first, mExtra.range.last + 1)
+        }
+        additionalEntries = extraEntriesMutable
+
         if (entryPrice == null && entryMode != "market_now") {
-            val mDirPrice = Regex("\\b(?:buy|sell|long|short)[ \\t]*[:\\-][ \\t]*([^\\n]+)", RegexOption.IGNORE_CASE).find(cleaned)
+            val mDirPrice = Regex(
+                "\\b(?:buy|sell|long|short)[ \\t]*[:\\-][ \\t]*([^\\n]*?)(?=\\b(?:take[\\s\\-]*profit|targets?|tps?|tp\\d+|stop[\\s\\-]*loss|stoploss|stop[\\s\\-]*targets?|sl|s/l|$SECTION_BREAK)\\b|\\n|$)",
+                RegexOption.IGNORE_CASE
+            ).find(working)
             if (mDirPrice != null) {
                 val nums = extractCleanNumbers(mDirPrice.groupValues[1])
                 if (nums.isNotEmpty()) {
                     entryPrice = nums[0]
                     additionalEntries = nums.drop(1)
+                    working = replaceSpanWithBreak(working, mDirPrice.range.first, mDirPrice.range.last + 1)
                 }
             }
         }
 
         if (entryPrice == null && entryMode != "market_now") {
-            if (Regex("\\b(?:buy|sell|long|short|entry)\\s*(?:[\\-:]\\s*)?now\\b", RegexOption.IGNORE_CASE).containsMatchIn(cleaned)) {
+            if (HybridOptionsParser.hasMarketNowKeyword(cleaned)) {
                 entryMode = "market_now"
             } else if (symbol != null && direction != null &&
-                Regex("\\b(?:tp|target|sl|stoploss|stop\\s*loss)\\b", RegexOption.IGNORE_CASE).containsMatchIn(cleaned)
+                Regex("\\b(?:tp|target|sl|stoploss|stop[\\s\\-]*loss|stop[\\s\\-]*target)\\b", RegexOption.IGNORE_CASE).containsMatchIn(cleaned)
             ) {
                 entryMode = "market_now"
             }
         }
 
-        var stopLoss: Double? = null
-        val mSl = Regex(
-            "\\b(?:stoploss|stop\\s*loss|sl)[ \\t]*[:\\-]?[ \\t]*(?:\\r?\\n[ \\t]*)?([0-9,]+(?:\\.[0-9]+)?)",
-            RegexOption.IGNORE_CASE
-        ).find(cleaned)
-        if (mSl != null) stopLoss = HybridOptionsParser.parseNumber(mSl.groupValues[1])
-
+        // 3. Extract Targets from remaining text (SL & Entry already masked with SECTION_BREAK)
         var targets: List<Double> = emptyList()
         val mTpSec = Regex(
-            "\\b(?:take\\s+profit\\s+targets?|take\\s+profit|targets?|tps?)\\b(.*?)(?=\\b(?:stoploss|stop\\s*loss|sl|leverage|published|manage\\s+your\\s+risk)\\b|$)",
+            "(?<!entry[\\s\\-])(?<!stop[\\s\\-])\\b(?:take[\\s\\-]+profit(?:[\\s\\-]+targets?)?|targets?|tps?)\\b(.*?)(?=\\b(?:stoploss|stop[\\s\\-]*loss(?:es)?|stop[\\s\\-]*targets?|s/l|sl|leverage|lev|published|manage\\s+your\\s+risk|account[\\s\\-]*usage|amount|trailing|margin|no\\s*reacts|$SECTION_BREAK)\\b|$)",
             setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
-        ).find(cleaned)
+        ).find(working)
         if (mTpSec != null) {
             targets = extractTargetsFromBlock(mTpSec.groupValues[1])
         }
         if (targets.isEmpty()) {
             val tpInline = mutableListOf<Double>()
-            val reInline = Regex("^\\s*(?:tp\\s*\\d*|target\\s*\\d*)\\s*[:\\-]?\\s*([^\\n]+)$", setOf(RegexOption.IGNORE_CASE, RegexOption.MULTILINE))
-            for (mTp in reInline.findAll(cleaned)) {
+            val reInline = Regex(
+                "^\\s*(?:take[\\s\\-]+profit\\s*\\d*|tp\\s*\\d*|target\\s*\\d*)\\s*[:\\-]?\\s*([^\\n]+)$",
+                setOf(RegexOption.IGNORE_CASE, RegexOption.MULTILINE)
+            )
+            for (mTp in reInline.findAll(working)) {
                 tpInline.addAll(extractTargetsFromBlock(mTp.groupValues[1]))
             }
             targets = HybridOptionsParser.cleanTargets(tpInline)
+        }
+
+        // 4. Exclude SL & apply direction-aware sanity filter on targets
+        if (stopLoss != null) {
+            targets = targets.filter { abs(it - stopLoss) > 1e-9 }
+        }
+        if (entryPrice != null && direction in setOf("BUY", "SELL")) {
+            val allEnt = listOf(entryPrice) + additionalEntries
+            val refLow = allEnt.min()
+            val refHigh = allEnt.max()
+            targets = if (direction == "BUY") {
+                targets.filter { it > refLow }
+            } else {
+                targets.filter { it < refHigh }
+            }
         }
 
         val issues = mutableListOf<String>()
@@ -164,8 +268,13 @@ object SignalParser {
         val review = if (status == "parsed") "not_required" else "required"
         val confidence = if (status == "parsed" && entryPrice != null) 0.94 else if (status == "parsed") 0.86 else 0.4
 
+        val entryDisp = if (entryPrice != null) {
+            (listOf(entryPrice) + additionalEntries).joinToString("/") { DefaultRulesEngine.formatG(it) }
+        } else {
+            entryMode
+        }
         val explParts = mutableListOf(
-            "Crypto parser: symbol=${symbol ?: "none"}, dir=${direction ?: "none"}, entry=${entryPrice?.let { DefaultRulesEngine.formatPyFloat(it) } ?: entryMode}"
+            "Crypto parser: symbol=${symbol ?: "none"}, dir=${direction ?: "none"}, entry=$entryDisp"
         )
         if (stopLoss != null) explParts += "SL=${DefaultRulesEngine.formatG(stopLoss)}"
         if (targets.isNotEmpty()) explParts += "TPs=${targets.joinToString("/") { DefaultRulesEngine.formatG(it) }}"
@@ -286,7 +395,7 @@ object SignalParser {
         var entryMode = "limit"
 
         val mEntryLine = Regex(
-            "\\b(?:entry\\s*zone|entry\\s*price|entries|entry|at|@)[ \\t]*[:\\-]?[ \\t]*([^\\n]+)",
+            "\\b(?:entry\\s*zone|entry\\s*price|entries|entrys|entry|enter|buy\\s+at|sell\\s+at|at|@)[ \\t]*[:\\-]?[ \\t]*([^\\n]+)",
             RegexOption.IGNORE_CASE
         ).find(working)
         if (mEntryLine != null) {
@@ -296,7 +405,7 @@ object SignalParser {
                 entryPrice = nums[0]
                 additionalEntries = nums.drop(1)
                 working = HybridOptionsParser.maskSpan(working, mEntryLine.range.first, mEntryLine.range.last + 1)
-            } else if (Regex("\\b(?:now|market|cmp)\\b", RegexOption.IGNORE_CASE).containsMatchIn(seg)) {
+            } else if (HybridOptionsParser.MARKET_NOW_SEGMENT_RE.containsMatchIn(seg)) {
                 entryMode = "market_now"
                 working = HybridOptionsParser.maskSpan(working, mEntryLine.range.first, mEntryLine.range.last + 1)
             }
@@ -335,7 +444,7 @@ object SignalParser {
         }
 
         if (entryPrice == null) {
-            if (Regex("\\b(?:buy|sell|long|short|entry)\\s*now\\b", RegexOption.IGNORE_CASE).containsMatchIn(working) ||
+            if (HybridOptionsParser.hasMarketNowKeyword(working) ||
                 (symbol != null && direction != null && Regex("\\b(?:tp|target)\\b", RegexOption.IGNORE_CASE).containsMatchIn(working))
             ) {
                 entryMode = "market_now"
@@ -451,21 +560,24 @@ object SignalParser {
             }
         }
         if (entryPrice == null) {
-            val mEnt = Regex("\\b(?:entry|at|cmp|near)[ \\t]*[:\\-]?[ \\t]*([^\\n]+)", RegexOption.IGNORE_CASE).find(block)
+            val mEnt = Regex(
+                "\\b(?:entry\\s*zone|entry\\s*price|entries|entrys|entry|enter|buy\\s+at|sell\\s+at|at|cmp|near)[ \\t]*[:\\-]?[ \\t]*([^\\n]+)",
+                RegexOption.IGNORE_CASE
+            ).find(block)
             if (mEnt != null) {
-                val nums = extractCleanNumbers(mEnt.groupValues[1])
+                val seg = mEnt.groupValues[1].trim()
+                val nums = extractCleanNumbers(seg)
                 if (nums.isNotEmpty()) {
                     entryPrice = nums[0]
                     additionalEntries = nums.drop(1)
+                } else if (HybridOptionsParser.MARKET_NOW_SEGMENT_RE.containsMatchIn(seg)) {
+                    entryMode = "market_now"
                 }
             }
         }
-        if (entryPrice == null && Regex("\\b(?:buy|sell)\\s*now\\b", RegexOption.IGNORE_CASE).containsMatchIn(block)) {
-            entryMode = "market_now"
-        }
 
         val mSl = Regex(
-            "\\b(?:stoploss|stop\\s*loss|sl)[ \\t]*[:\\-]?[ \\t]*(?:\\r?\\n[ \\t]*)?([0-9,]+(?:\\.[0-9]+)?)",
+            "\\b(?:stoploss|stop[\\s\\-]*loss|sl)[ \\t]*[:\\-]?[ \\t]*(?:\\r?\\n[ \\t]*)?([0-9,]+(?:\\.[0-9]+)?)",
             RegexOption.IGNORE_CASE
         ).find(block)
         val stopLoss = mSl?.let { HybridOptionsParser.parseNumber(it.groupValues[1]) }
@@ -481,6 +593,14 @@ object SignalParser {
             }
         }
         val targets = HybridOptionsParser.cleanTargets(targetsMutable)
+
+        if (entryPrice == null && entryMode != "market_now") {
+            if (HybridOptionsParser.hasMarketNowKeyword(block) ||
+                (symbol != null && direction != null && (stopLoss != null || targets.isNotEmpty()))
+            ) {
+                entryMode = "market_now"
+            }
+        }
 
         val issues = mutableListOf<String>()
         if (symbol == null) issues += "missing MCX commodity"

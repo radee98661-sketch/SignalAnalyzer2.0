@@ -210,6 +210,20 @@ class ProviderContractTest {
                   "ok": true,
                   "next_since_ms": 1770001234567,
                   "data": {
+                    "Index Options": [
+                      {
+                        "received_at": "2026-03-20T10:01:00Z",
+                        "notification_time": "2026-03-20T10:01:00Z",
+                        "source_app": "Telegram",
+                        "package": "org.telegram.messenger",
+                        "channel": "NiftyDesk",
+                        "category": "Index Options",
+                        "title": "NiftyDesk",
+                        "message": "BUY NIFTY 24500 CE @ 120 SL 95 TGT 150",
+                        "notification_id": "gs-idx-1",
+                        "delivery_id": "gs-idx-1"
+                      }
+                    ],
                     "Crypto": [
                       {
                         "received_at": "2026-03-20T10:00:00Z",
@@ -231,10 +245,11 @@ class ProviderContractTest {
         )
         val res1 = syncClient.syncGoogleSheets()
         assertEquals("success", res1.status)
-        assertEquals(1, res1.imported)
+        assertEquals(2, res1.imported)
         assertEquals("1770001234567", db.coreDao().getSetting("google_sheets_next_since_ms"))
+        server.takeRequest() // consume first request
 
-        // Envelope 2: `worksheets` format
+        // Envelope 2: `worksheets` format + confirms since_ms query param is sent on subsequent poll
         server.enqueue(
             MockResponse().setResponseCode(200).setBody(
                 """
@@ -262,6 +277,9 @@ class ProviderContractTest {
         val res2 = syncClient.syncGoogleSheets()
         assertEquals("success", res2.status)
         assertEquals(1, res2.imported)
+        val req2 = server.takeRequest()
+        val expectedSince = (1770001234567L - GoogleSheetsSyncClient.EDIT_LOOKBACK_MS).toString()
+        assertTrue(req2.path.orEmpty().contains("since_ms=$expectedSince"))
 
         // Envelope 3: Unexpected payload -> safe shape diagnostic without leaking values
         server.enqueue(

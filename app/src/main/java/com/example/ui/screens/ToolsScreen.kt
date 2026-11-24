@@ -88,7 +88,7 @@ private fun ParseAndImportTab(viewModel: MainViewModel) {
     var category by remember { mutableStateOf("Crypto") }
     var channel by remember { mutableStateOf("Manual") }
 
-    val cats = listOf("Crypto", "Forex", "Indian Options", "Stock Options", "MCX")
+    val cats = listOf("Index Options", "Stock Options", "MCX", "Forex", "Crypto")
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -277,7 +277,7 @@ private fun IntegrationsTab(viewModel: MainViewModel) {
                         onClick = {
                             val cfg = JSONObject().apply {
                                 put("apps_script_url", sheetsUrl.trim())
-                                put("worksheets", JSONArray(listOf("Crypto", "Indian Options", "Stock Options", "MCX", "Forex")))
+                                put("worksheets", JSONArray(listOf("Index Options", "Stock Options", "MCX", "Forex", "Crypto")))
                             }
                             val sec = if (sheetsToken.isNotBlank()) mapOf("access_token" to sheetsToken.trim()) else emptyMap()
                             viewModel.saveIntegration("google_sheets", cfg, sec)
@@ -358,7 +358,7 @@ private fun IntegrationsTab(viewModel: MainViewModel) {
 
         // Angel One
         item {
-            SectionCard(title = "Angel One SmartAPI", subtitle = "Indian Options & MCX verification using RFC 6238 TOTP & Scrip Master.") {
+            SectionCard(title = "Angel One SmartAPI", subtitle = "Index Options, Stock Options & MCX verification using RFC 6238 TOTP & Scrip Master.") {
                 OutlinedTextField(value = angelApiKey, onValueChange = { angelApiKey = it }, label = { Text("API Key") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(), singleLine = true)
                 OutlinedTextField(value = angelClientId, onValueChange = { angelClientId = it }, label = { Text("Client ID") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(), singleLine = true)
                 OutlinedTextField(value = angelPassword, onValueChange = { angelPassword = it }, label = { Text("Password / PIN") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(), singleLine = true)

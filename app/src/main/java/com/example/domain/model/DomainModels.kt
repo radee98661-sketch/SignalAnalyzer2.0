@@ -230,7 +230,7 @@ data class SourceNotificationRow(
         )
 
         val DEFAULT_CATEGORIES = listOf(
-            "Crypto", "Forex", "Indian Options", "Stock Options", "MCX"
+            "Index Options", "Stock Options", "MCX", "Forex", "Crypto"
         )
 
         fun fromMap(map: Map<String, String?>): SourceNotificationRow = SourceNotificationRow(

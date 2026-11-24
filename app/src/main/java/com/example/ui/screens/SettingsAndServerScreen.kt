@@ -310,8 +310,16 @@ private fun SettingsAndRulesTab(viewModel: MainViewModel) {
             ) {
                 rules.forEach { (catKey, catRule) ->
                     HorizontalDivider(color = NavyBorder)
+                    val displayCat = when (catKey) {
+                        "OPTIONS" -> "Index Options"
+                        "STOCK_OPTIONS" -> "Stock Options"
+                        "MCX" -> "MCX"
+                        "FOREX" -> "Forex"
+                        "CRYPTO" -> "Crypto"
+                        else -> catKey
+                    }
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text(catKey, style = MaterialTheme.typography.titleSmall, color = EmeraldAccent)
+                        Text(displayCat, style = MaterialTheme.typography.titleSmall, color = EmeraldAccent)
                         Text(
                             "Fallback SL: ${catRule.categoryDefault ?: "—"} | TP1/2/3: ${catRule.tp1 ?: "—"}/${catRule.tp2 ?: "—"}/${catRule.tp3 ?: "—"} | " +
                                 if (catKey == "CRYPTO") "USD: $${catRule.usdAmount}" else "Lots: ${catRule.lots} × ${catRule.lotSize ?: "Auto"}",

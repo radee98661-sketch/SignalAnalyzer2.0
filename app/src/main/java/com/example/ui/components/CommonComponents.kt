@@ -29,11 +29,13 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.example.data.repository.EnrichedSignal
 import com.example.domain.model.ApiHealthSummary
 import com.example.ui.theme.AmberContainer
@@ -47,6 +49,7 @@ import com.example.ui.theme.NavyBorder
 import com.example.ui.theme.NavyCard
 import com.example.ui.theme.NavyCardElevated
 import com.example.ui.theme.NavyInput
+import com.example.ui.theme.NavyWell
 import com.example.ui.theme.SignalBlue
 import com.example.ui.theme.SignalBlueContainer
 import com.example.ui.theme.TextSecondary
@@ -73,6 +76,22 @@ fun formatPnl(amount: Double, currency: String = "INR"): String {
         String.format(Locale.US, "%,.2f", absVal)
     }
     return "$sign$sym$num"
+}
+
+fun formatCompactPrice(price: Double?): String {
+    if (price == null) return "—"
+    val absVal = abs(price)
+    return when {
+        absVal >= 1000.0 -> if (price == price.toLong().toDouble()) String.format(Locale.US, "%.0f", price) else String.format(Locale.US, "%.2f", price)
+        absVal >= 10.0 -> String.format(Locale.US, "%.2f", price).trimEnd('0').trimEnd('.')
+        absVal >= 1.0 -> String.format(Locale.US, "%.4f", price).trimEnd('0').trimEnd('.')
+        else -> String.format(Locale.US, "%.5f", price).trimEnd('0').trimEnd('.')
+    }
+}
+
+fun isEditedSignal(explanation: String?): Boolean {
+    if (explanation.isNullOrBlank()) return false
+    return explanation.contains("edited", ignoreCase = true)
 }
 
 fun formatShortTimestamp(iso: String?): String {
@@ -107,9 +126,15 @@ fun SectionCard(
         modifier = modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = NavyCard),
         border = BorderStroke(1.dp, NavyBorder),
-        shape = RoundedCornerShape(12.dp)
+        shape = RoundedCornerShape(14.dp)
     ) {
-        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Brush.verticalGradient(listOf(NavyCardElevated.copy(alpha = 0.55f), NavyCard)))
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
             if (title != null || action != null) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -143,9 +168,15 @@ fun MetricCard(
         modifier = modifier,
         colors = CardDefaults.cardColors(containerColor = NavyCard),
         border = BorderStroke(1.dp, NavyBorder),
-        shape = RoundedCornerShape(12.dp)
+        shape = RoundedCornerShape(14.dp)
     ) {
-        Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Brush.verticalGradient(listOf(NavyCardElevated.copy(alpha = 0.5f), NavyWell)))
+                .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
             Text(label, style = MaterialTheme.typography.labelMedium, color = TextSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(
                 value,
@@ -172,6 +203,35 @@ fun StatusPill(text: String, bg: Color, fg: Color, modifier: Modifier = Modifier
             modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+@Composable
+fun MicroBadge(
+    text: String,
+    bg: Color,
+    fg: Color,
+    border: Color = fg.copy(alpha = 0.45f),
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        modifier = modifier,
+        color = bg,
+        shape = RoundedCornerShape(5.dp),
+        border = BorderStroke(1.dp, border)
+    ) {
+        Text(
+            text = text,
+            color = fg,
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontFamily = MonoFontFamily,
+                fontWeight = FontWeight.Bold,
+                fontSize = 10.sp,
+                letterSpacing = 0.4.sp
+            ),
+            modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp),
+            maxLines = 1
         )
     }
 }

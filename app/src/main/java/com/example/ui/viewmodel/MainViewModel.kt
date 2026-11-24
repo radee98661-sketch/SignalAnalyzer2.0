@@ -42,7 +42,8 @@ data class SignalFilterState(
     val dateFrom: String = "",
     val dateTo: String = "",
     val tpFilter: String = "",
-    val pnlBasis: String = "tp1"
+    val pnlBasis: String = "tp1",
+    val searchQuery: String = ""
 )
 
 data class AnalyticsFilterState(
@@ -236,7 +237,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _categories.value = cats
         _channels.value = chans
         val (dFrom, dTo) = resolveDateWindow(f.datePreset, f.dateFrom, f.dateTo)
-        val list = repo.getSignals(
+        val rawList = repo.getSignals(
             category = f.category,
             channel = f.channel,
             symbol = "",
@@ -246,6 +247,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             dateTo = dTo,
             tpFilter = f.tpFilter
         )
+        val q = f.searchQuery.trim().lowercase()
+        val list = if (q.isEmpty()) {
+            rawList
+        } else {
+            rawList.filter { sig ->
+                val r = sig.row
+                (r.symbol?.lowercase()?.contains(q) == true) ||
+                    (r.channel?.lowercase()?.contains(q) == true) ||
+                    (r.category?.lowercase()?.contains(q) == true) ||
+                    (r.message?.lowercase()?.contains(q) == true) ||
+                    ("#${r.id}".contains(q))
+            }
+        }
         _signals.value = list
         _filteredPnlSummary.value = repo.computeFilteredPnlSummary(list, f.pnlBasis)
     }
@@ -343,11 +357,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         refreshSignals()
     }
 
-    fun saveManualSignalEdit(id: Long, edit: SignalEditPayload) = viewModelScope.launch(Dispatchers.IO) {
-        repo.updateSignal(id, edit)
-        _statusMessage.value = "Saved manual correction for signal #$id."
-        refreshSignals()
-        refreshNotifications()
+    fun saveManualSignalEdit(id: Long, edit: SignalEditPayload, verifyImmediately: Boolean = false) = viewModelScope.launch(Dispatchers.IO) {
+        _isBusy.value = true
+        try {
+            repo.updateSignal(id, edit)
+            if (verifyImmediately) {
+                val res = repo.verificationService.processSignal(id, "manual")
+                val chart = repo.getSignalChart(id)
+                if (chart != null) {
+                    _charts.value = _charts.value + (id to chart)
+                }
+                _statusMessage.value = "Saved & verified #$id → ${res.status}"
+            } else {
+                _statusMessage.value = "Saved manual correction for signal #$id."
+            }
+            refreshSignals()
+            refreshOverview()
+            refreshNotifications()
+        } catch (e: Exception) {
+            _statusMessage.value = "Save/verify error for #$id: ${e.message}"
+        } finally {
+            _isBusy.value = false
+        }
     }
 
     fun previewParse(message: String, category: String) = viewModelScope.launch(Dispatchers.IO) {

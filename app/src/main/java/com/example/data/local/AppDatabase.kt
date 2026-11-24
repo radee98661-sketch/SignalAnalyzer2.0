@@ -56,6 +56,9 @@ abstract class AppDatabase : RoomDatabase() {
             dao.insertSchemaVersion(SchemaVersionEntity(3))
         }
 
+        dao.deleteCategoryByName("Indian Options")
+        dao.migrateRawNotificationCategory("Indian Options", "Index Options")
+        dao.migrateChannelCategory("Indian Options", "Index Options")
         for (cat in SourceNotificationRow.DEFAULT_CATEGORIES) {
             dao.insertCategory(CategoryEntity(name = cat, enabled = 1))
         }

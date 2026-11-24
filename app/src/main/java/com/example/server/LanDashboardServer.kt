@@ -135,12 +135,12 @@ class LanDashboardServer(
                     authManager.clearAuthFailures(remoteHost)
                     wsClients.incrementAndGet()
                     try {
-                        send(Frame.Text(JSONObject(mapOf("type" to "auth_ok")).toString()))
-                        val collectJob = launch {
+                        val collectJob = launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
                             repository.eventBus.events.collect { ev ->
                                 send(Frame.Text(eventToJson(ev).toString()))
                             }
                         }
+                        send(Frame.Text(JSONObject(mapOf("type" to "auth_ok")).toString()))
                         try {
                             for (frame in incoming) {
                                 if (frame is Frame.Text && frame.readText().trim() == "ping") {
@@ -1086,8 +1086,8 @@ class LanDashboardServer(
     private fun defaultSlRulesToDashboardJson(rules: Map<String, DefaultSlCategoryRule>): JSONObject {
         data class CatMeta(val key: String, val title: String, val unit: String, val unitLabel: String, val sizingMode: String)
         val metas = listOf(
-            CatMeta("OPTIONS", "Indian Index Options", "points", "Option Premium Points (₹)", "lots"),
-            CatMeta("STOCK_OPTIONS", "Indian Stock Options", "points", "Option Premium Points (₹)", "lots"),
+            CatMeta("OPTIONS", "Index Options", "points", "Option Premium Points (₹)", "lots"),
+            CatMeta("STOCK_OPTIONS", "Stock Options", "points", "Option Premium Points (₹)", "lots"),
             CatMeta("MCX", "MCX Commodities (Futures & Options)", "points", "MCX Points (₹)", "lots"),
             CatMeta("FOREX", "Forex & Global Commodities", "pips", "Pips", "lots"),
             CatMeta("CRYPTO", "Crypto (USD-M Futures)", "pct", "Percentage (%)", "usd")

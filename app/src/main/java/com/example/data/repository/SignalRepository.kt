@@ -1582,11 +1582,11 @@ class SignalRepository(
         val SUPPORTED_PROVIDERS = setOf("google_sheets", "binance", "angel_one", "twelve_data")
 
         val CATEGORY_ALIASES = linkedMapOf(
-            "Crypto" to listOf("crypto"),
-            "Forex" to listOf("forex", "fx"),
-            "Indian Options" to listOf("indian options", "options"),
+            "Index Options" to listOf("index options", "indian options", "options"),
             "Stock Options" to listOf("stock options"),
-            "MCX" to listOf("mcx")
+            "MCX" to listOf("mcx"),
+            "Forex" to listOf("forex", "fx"),
+            "Crypto" to listOf("crypto")
         )
 
         val ANGEL_INTERVAL_MAP = mapOf(

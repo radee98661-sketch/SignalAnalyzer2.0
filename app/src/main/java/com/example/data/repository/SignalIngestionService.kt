@@ -58,8 +58,176 @@ class SignalIngestionService(
             val verDao = db.verificationDao()
             val nowIso = TimeUtils.utcNowIso()
 
-            if (notificationId != null && core.findRawIdByNotificationId(notificationId) != null) {
-                return@withTransaction null to "duplicate"
+            if (notificationId != null) {
+                val existingRaw = core.getRawNotificationByNotificationId(notificationId)
+                if (existingRaw != null) {
+                    val prevMsg = existingRaw.message.orEmpty().trim()
+                    val nextMsg = row.message.trim()
+                    if (prevMsg == nextMsg) {
+                        return@withTransaction null to "duplicate"
+                    }
+                    // Message was EDITED in Telegram / Google Sheets (same notification_id, updated text)
+                    core.updateEditedRawNotification(
+                        id = existingRaw.id,
+                        message = row.message,
+                        title = row.title,
+                        category = row.category,
+                        receivedAt = row.receivedAt,
+                        deliveryId = row.deliveryId
+                    )
+                    val incomingTime = TimeUtils.notificationInstant(
+                        existingRaw.notificationTime?.takeIf { it.isNotBlank() } ?: row.notificationTime,
+                        existingRaw.receivedAt?.takeIf { it.isNotBlank() } ?: row.receivedAt
+                    )
+                    val effCat = rawCat.ifBlank { existingRaw.category.orEmpty() }
+                    val effChannel = channel.ifBlank { existingRaw.channel.orEmpty() }
+
+                    // Inherit active Forex symbol if applicable
+                    if (effCat.lowercase(Locale.US) in setOf("forex", "fx")) {
+                        val cutoffIso = incomingTime.minus(Duration.ofMinutes(30)).toString()
+                        val recentFxSymbol = core.findRecentForexSymbolForReparse(
+                            channel = effChannel,
+                            cutoffIso = cutoffIso,
+                            upperIso = incomingTime.toString(),
+                            excludeRawId = existingRaw.id
+                        )
+                        if (!recentFxSymbol.isNullOrBlank()) {
+                            parsedItems = parsedItems.map { item ->
+                                if (item.symbol.isNullOrBlank() && !item.direction.isNullOrBlank() &&
+                                    (item.entryPrice != null || item.entryMode == "market_now")
+                                ) {
+                                    var inherited = item.copy(
+                                        symbol = recentFxSymbol,
+                                        status = "parsed",
+                                        review = "not_required",
+                                        confidence = 0.85,
+                                        explanation = item.explanation.trimEnd('.') +
+                                            " | Inherited symbol $recentFxSymbol from recent channel message."
+                                    )
+                                    inherited = DefaultRulesEngine.applyDefaultSl(inherited, effCat, slRules)
+                                    inherited = DefaultRulesEngine.applyDefaultTargets(inherited, effCat, slRules)
+                                    inherited
+                                } else {
+                                    item
+                                }
+                            }
+                        }
+                    }
+
+                    val settings = core.getAllSettings().associate { it.key to it.value }
+                    val initialWait = settings["verification_initial_wait_minutes"]?.toIntOrNull() ?: 15
+                    val repeatMinutes = settings["verification_repeat_minutes"]?.toIntOrNull() ?: 15
+                    val expiryHours = settings["verification_expiry_hours"]?.toLongOrNull() ?: 168L
+                    val timeframe = settings["verification_timeframe"] ?: "1m"
+                    val firstSched = incomingTime.plus(Duration.ofMinutes(initialWait.toLong()))
+                    val expiresAt = incomingTime.plus(Duration.ofHours(expiryHours))
+                    val nowInstant = Instant.now()
+
+                    val existingSignals = core.getSignalsByRawId(existingRaw.id)
+                    val hasManualOverride = existingSignals.any { it.parsingStatus == "manually_corrected" }
+                    if (!hasManualOverride) {
+                        val updatedSignalIds = mutableListOf<Pair<Long, ParsedSignal>>()
+                        parsedItems.forEachIndexed { idx, item ->
+                            val existingSig = existingSignals.getOrNull(idx)
+                            val sigId = if (existingSig != null) {
+                                core.updateSignalParsedFields(
+                                    id = existingSig.id,
+                                    symbol = item.symbol,
+                                    direction = item.direction,
+                                    entryPrice = item.entryPrice,
+                                    additionalEntries = JsonUtils.doubleListToJson(item.additionalEntries),
+                                    stopLoss = item.stopLoss,
+                                    targets = JsonUtils.doubleListToJson(item.targets),
+                                    optionType = item.optionType,
+                                    strikePrice = item.strikePrice,
+                                    expiryDate = item.expiryDate,
+                                    entryMode = item.entryMode.ifBlank { "limit" },
+                                    parsingStatus = item.status,
+                                    parsingConfidence = item.confidence,
+                                    manualReviewStatus = item.review,
+                                    parsingExplanation = (item.explanation.trimEnd('.') + " | Auto-reparsed from edited message.").trim(),
+                                    updatedAt = nowIso
+                                )
+                                existingSig.id
+                            } else {
+                                core.insertSignal(
+                                    SignalEntity(
+                                        rawNotificationId = existingRaw.id,
+                                        symbol = item.symbol,
+                                        direction = item.direction,
+                                        entryPrice = item.entryPrice,
+                                        additionalEntries = JsonUtils.doubleListToJson(item.additionalEntries),
+                                        stopLoss = item.stopLoss,
+                                        targets = JsonUtils.doubleListToJson(item.targets),
+                                        optionType = item.optionType,
+                                        strikePrice = item.strikePrice,
+                                        expiryDate = item.expiryDate,
+                                        entryMode = item.entryMode.ifBlank { "limit" },
+                                        parsingStatus = item.status,
+                                        parsingConfidence = item.confidence,
+                                        manualReviewStatus = item.review,
+                                        verificationStatus = "pending",
+                                        parsingExplanation = (item.explanation.trimEnd('.') + " | Auto-parsed from edited message.").trim(),
+                                        updatedAt = nowIso
+                                    )
+                                )
+                            }
+                            updatedSignalIds += sigId to item
+                        }
+
+                        for ((sigId, item) in updatedSignalIds) {
+                            val canVerify = item.status == "parsed" &&
+                                !item.symbol.isNullOrBlank() &&
+                                item.direction in setOf("BUY", "SELL") &&
+                                (item.entryPrice != null || item.entryMode == "market_now")
+                            if (canVerify) {
+                                val isIdleWait = firstSched.isAfter(nowInstant)
+                                val nextTime = if (isIdleWait) firstSched.toString() else nowInstant.toString()
+                                val existingSched = verDao.getScheduleForSignal(sigId)
+                                if (existingSched == null) {
+                                    verDao.insertSchedule(
+                                        VerificationScheduleEntity(
+                                            signalId = sigId,
+                                            signalStartAt = incomingTime.toString(),
+                                            initialWaitMinutes = initialWait,
+                                            intervalMinutes = repeatMinutes,
+                                            timeframe = timeframe,
+                                            firstScheduledAt = firstSched.toString(),
+                                            nextScheduledAt = nextTime,
+                                            expiresAt = expiresAt.toString(),
+                                            status = "scheduled",
+                                            lastResult = if (isIdleWait) {
+                                                "Idle wait (${initialWait}m) after edited message"
+                                            } else {
+                                                "Queued for catch-up verification after message edit"
+                                            },
+                                            createdAt = nowIso,
+                                            updatedAt = nowIso
+                                        )
+                                    )
+                                } else {
+                                    verDao.rescheduleSignal(
+                                        signalId = sigId,
+                                        startAt = incomingTime.toString(),
+                                        firstAt = firstSched.toString(),
+                                        nextAt = nextTime,
+                                        updatedAt = nowIso
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    core.insertSystemLog(
+                        SystemLogEntity(
+                            createdAt = nowIso,
+                            severity = "INFO",
+                            source = "ingest",
+                            message = "Updated edited notification ${existingRaw.id} (${parsedItems.size} signal(s))"
+                        )
+                    )
+                    return@withTransaction existingRaw.id to "updated"
+                }
             }
 
             val rawId = core.insertRawNotification(
@@ -245,8 +413,8 @@ class SignalIngestionService(
             rawId to "imported"
         }
 
-        if (result.second == "imported") {
-            eventBus.emit(AppEvent("signal.changed", result.first, "imported", null, TimeUtils.utcNowIso()))
+        if (result.second == "imported" || result.second == "updated") {
+            eventBus.emit(AppEvent("signal.changed", result.first, result.second, null, TimeUtils.utcNowIso()))
         }
         return result
     }

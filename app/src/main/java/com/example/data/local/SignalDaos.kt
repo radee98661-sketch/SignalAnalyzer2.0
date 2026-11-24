@@ -159,6 +159,15 @@ interface CoreDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertCategory(category: CategoryEntity): Long
 
+    @Query("DELETE FROM categories WHERE name = :name")
+    suspend fun deleteCategoryByName(name: String)
+
+    @Query("UPDATE raw_notifications SET category = :newName WHERE LOWER(TRIM(COALESCE(category, ''))) = LOWER(:oldName)")
+    suspend fun migrateRawNotificationCategory(oldName: String, newName: String)
+
+    @Query("UPDATE channels SET category = :newName WHERE LOWER(TRIM(COALESCE(category, ''))) = LOWER(:oldName)")
+    suspend fun migrateChannelCategory(oldName: String, newName: String)
+
     @Query("SELECT name FROM categories WHERE enabled=1 ORDER BY id")
     suspend fun getEnabledCategoryNames(): List<String>
 
@@ -189,6 +198,24 @@ interface CoreDao {
     // Raw Notifications
     @Query("SELECT id FROM raw_notifications WHERE notification_id = :notificationId LIMIT 1")
     suspend fun findRawIdByNotificationId(notificationId: String): Long?
+
+    @Query("SELECT * FROM raw_notifications WHERE notification_id = :notificationId LIMIT 1")
+    suspend fun getRawNotificationByNotificationId(notificationId: String): RawNotificationEntity?
+
+    @Query(
+        "UPDATE raw_notifications SET message=:message, title=COALESCE(NULLIF(:title, ''), title), " +
+            "category=COALESCE(NULLIF(:category, ''), category), received_at=COALESCE(NULLIF(:receivedAt, ''), received_at), " +
+            "delivery_id=COALESCE(NULLIF(:deliveryId, ''), delivery_id), is_duplicate=0, duplicate_of=NULL, duplicate_reason=NULL " +
+            "WHERE id=:id"
+    )
+    suspend fun updateEditedRawNotification(
+        id: Long,
+        message: String,
+        title: String?,
+        category: String?,
+        receivedAt: String?,
+        deliveryId: String?
+    )
 
     @Insert
     suspend fun insertRawNotification(raw: RawNotificationEntity): Long

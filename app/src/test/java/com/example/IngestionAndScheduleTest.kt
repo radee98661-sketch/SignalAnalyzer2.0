@@ -114,6 +114,77 @@ class IngestionAndScheduleTest {
     }
 
     @Test
+    fun `updates edited Telegram message sharing same notificationId reparses and schedules verification`() = runBlocking {
+        val now = Instant.now()
+        val initialTeaser = SourceNotificationRow(
+            receivedAt = now.toString(),
+            notificationTime = now.toString(),
+            channel = "THE WOLF (CRYPTO)®",
+            category = "Crypto",
+            message = "mmt long",
+            notificationId = "-1002007658025:57164169216"
+        )
+        val (rawId1, st1) = ingestion.ingest(initialTeaser)
+        assertNotNull(rawId1)
+        assertEquals("imported", st1)
+
+        val sigBefore = db.coreDao().getSignalsByRawId(rawId1!!).single()
+        assertEquals("needs_review", sigBefore.parsingStatus)
+        assertNull(db.verificationDao().getScheduleForSignal(sigBefore.id))
+
+        // Channel edits the same Telegram message (same notificationId) with full signal details
+        val editedFull = initialTeaser.copy(
+            receivedAt = now.plusSeconds(25).toString(),
+            message = """
+                👍 THE WOLF SCALPER 👍
+
+                🚀 LONG: ${'$'}MMT/USDT
+                LEVERAGE: 50x
+
+                ✔️ENTRY PRICE:0.2325
+                ✔️ 2nd ENTRY: 0.2250
+                __________
+                ☄️ TAKE- PROFIT
+
+                0.2400 - 0.2550 - 0.2780
+
+                STOP LOSS: 0.2100
+
+                CLICK TO JOIN BITUNIX
+
+                #WE_STAND_WITH_PALESTINE
+
+                REACTIONS?
+            """.trimIndent()
+        )
+        val (rawId2, st2) = ingestion.ingest(editedFull)
+        assertEquals(rawId1, rawId2)
+        assertEquals("updated", st2)
+
+        val updatedRaw = db.coreDao().getRawNotificationById(rawId1)!!
+        assertTrue(updatedRaw.message.orEmpty().contains("MMT/USDT"))
+
+        val sigAfter = db.coreDao().getSignalsByRawId(rawId1).single()
+        assertEquals(sigBefore.id, sigAfter.id)
+        assertEquals("parsed", sigAfter.parsingStatus)
+        assertEquals("MMTUSDT", sigAfter.symbol)
+        assertEquals("BUY", sigAfter.direction)
+        assertEquals(0.2325, sigAfter.entryPrice!!, 0.00001)
+        assertEquals("[0.225]", sigAfter.additionalEntries)
+        assertEquals(0.21, sigAfter.stopLoss!!, 0.00001)
+        assertEquals("[0.24,0.255,0.278]", sigAfter.targets)
+
+        val sched = db.verificationDao().getScheduleForSignal(sigAfter.id)
+        assertNotNull(sched)
+        assertEquals("scheduled", sched!!.status)
+
+        // Subsequent poll with unchanged edited text -> rejected as duplicate
+        val (rawId3, st3) = ingestion.ingest(editedFull)
+        assertNull(rawId3)
+        assertEquals("duplicate", st3)
+    }
+
+    @Test
     fun `inherits recent Forex symbol from same channel within 30 minutes`() = runBlocking {
         val now = Instant.now()
         val first = SourceNotificationRow(

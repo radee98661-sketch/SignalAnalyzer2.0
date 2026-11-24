@@ -111,7 +111,7 @@
       <form id="sheets-form" class="form-grid">
         <label>Apps Script Web App URL<input name="apps_script_url" type="url"></label>
         <label>Optional access token<input name="access_token" type="password" placeholder="Leave empty to keep saved token"></label>
-        <label>Worksheets<input name="worksheets" value="Crypto, Indian Options, Stock Options, MCX, Forex"></label>
+        <label>Worksheets<input name="worksheets" value="Index Options, Stock Options, MCX, Forex, Crypto"></label>
         <label>Sync interval (seconds)<input name="sync_interval_seconds" type="number" min="5" value="30"></label>
         <label>Automatic sync<select name="auto_sync"><option value="true">Enabled</option><option value="false">Disabled</option></select></label>
         <button class="primary">Save Google Sheets</button>
@@ -170,75 +170,103 @@
   </section>
 
   <section id="signals" class="view">
-    <article>
-      <div class="toolbar">
+    <article class="signals-shell">
+      <div class="toolbar" style="margin-bottom:10px">
         <div>
           <h2>Signals</h2>
-          <p class="muted">Tap any signal card to expand raw message, parsed data, multi-entry trade legs, P&amp;L, and OHLC marker chart. Select checkboxes to batch-process or delete.</p>
+          <p class="muted">Visual TP/SL ladder on every card. Tap a card to expand multi-entry legs, timeline, and interactive OHLC chart.</p>
         </div>
-        <button class="primary" id="refresh-signals">Refresh</button>
+        <div class="actions">
+          <button type="button" id="open-review-queue-btn" class="review-queue-pill" style="display:none">&#x26A0; Review (<span id="review-queue-count">0</span>)</button>
+          <button class="primary" id="refresh-signals">Refresh</button>
+        </div>
       </div>
+
       <div id="category-filters" class="category-filters"></div>
-      <div class="signal-filters">
-        <label>Channel<select id="channel-filter"><option value="">All channels</option></select></label>
-        <label>Verification / Status
-          <select id="verification-filter">
-            <option value="">All Statuses</option>
-            <option value="needs_review">Needs Review (Unparsed)</option>
-            <option value="manual_needed">Manual Processing Needed</option>
-            <option value="scheduled">Auto-Scheduled (Active)</option>
-            <option value="pending">Pending</option>
-            <option value="awaiting_market_data">Awaiting Market Data</option>
-            <option value="historical_data_missing">No Historical Data</option>
-            <option value="entry_hit">Entry Hit</option>
-            <option value="target_hit">TP Hit (Target Hit)</option>
-            <option value="stop_loss_hit">SL Hit (Stop Loss Hit)</option>
-            <option value="ambiguous">Ambiguous</option>
-          </select>
-        </label>
-        <label>Milestone / TP
-          <select id="tp-filter">
-            <option value="">All Milestones</option>
-            <option value="tp1_plus">TP1+ Hit</option>
-            <option value="tp2_plus">TP2+ Hit</option>
-            <option value="tp3_plus">TP3+ Hit</option>
-            <option value="all_tps">All TPs Hit</option>
-            <option value="tp1_only">TP1 Only</option>
-            <option value="tp_then_sl">TP → SL Closed</option>
-            <option value="sl_only">SL Hit Only</option>
-            <option value="active">Active Monitoring</option>
-          </select>
-        </label>
-        <label>P&amp;L Basis
-          <select id="pnl-basis-filter">
-            <option value="tp1" selected>TP1 (Default)</option>
-            <option value="tp2">TP2</option>
-            <option value="tp3">TP3</option>
-            <option value="highest_tp">Highest TP</option>
-          </select>
-        </label>
-        <label>From date<input id="signal-date-from" type="date"></label>
-        <label>To date<input id="signal-date-to" type="date"></label>
-        <label>Notification type
-          <select id="notification-type-filter">
-            <option value="all">All Notifications</option>
-            <option value="primary" selected>Primary Notifications</option>
-            <option value="duplicates">Duplicates</option>
-            <option value="updates">Signal Updates</option>
-          </select>
-        </label>
-        <button id="clear-signal-filters">Clear filters</button>
-        <button id="select-all">Select all</button>
-        <button id="select-filtered">Select filtered</button>
-        <button id="clear-selection">Clear selection</button>
-        <button id="reparse-selected">Re-parse selected</button>
-        <button id="delete-selected" class="btn-danger" type="button">Delete selected</button>
-        <button class="primary" id="process-selected">Process selected</button>
+
+      <div class="signals-compact-bar">
+        <div class="search-box">
+          <span class="search-ico">&#x1F50D;</span>
+          <input id="signal-search" type="search" placeholder="Search symbol, channel, #id or message...">
+        </div>
+        <button type="button" id="toggle-signal-filters" class="filter-toggle-btn">&#x2699; Filters <span id="active-filter-badge" class="filter-badge" style="display:none">0</span></button>
+        <button type="button" id="select-all">Select All</button>
+        <button type="button" id="clear-signal-filters" style="display:none">Reset</button>
       </div>
-      <div id="signals-pnl-summary" class="pnl-summary-strip"></div>
+
+      <div id="active-filter-chips" class="active-filter-chips"></div>
+
+      <div id="signal-filter-drawer" class="filter-drawer">
+        <div class="filter-drawer-grid">
+          <label>Channel<select id="channel-filter"><option value="">All channels</option></select></label>
+          <label>Verification / Status
+            <select id="verification-filter">
+              <option value="">All Statuses</option>
+              <option value="needs_review">Needs Review (Unparsed)</option>
+              <option value="manual_needed">Manual Processing Needed</option>
+              <option value="scheduled">Auto-Scheduled (Active)</option>
+              <option value="pending">Pending</option>
+              <option value="awaiting_market_data">Awaiting Market Data</option>
+              <option value="historical_data_missing">No Historical Data</option>
+              <option value="entry_hit">Entry Hit</option>
+              <option value="target_hit">TP Hit (Target Hit)</option>
+              <option value="stop_loss_hit">SL Hit (Stop Loss Hit)</option>
+              <option value="ambiguous">Ambiguous</option>
+            </select>
+          </label>
+          <label>Milestone / TP
+            <select id="tp-filter">
+              <option value="">All Milestones</option>
+              <option value="tp1_plus">TP1+ Hit</option>
+              <option value="tp2_plus">TP2+ Hit</option>
+              <option value="tp3_plus">TP3+ Hit</option>
+              <option value="all_tps">All TPs Hit</option>
+              <option value="tp1_only">TP1 Only</option>
+              <option value="tp_then_sl">TP → SL Closed</option>
+              <option value="sl_only">SL Hit Only</option>
+              <option value="active">Active Monitoring</option>
+            </select>
+          </label>
+          <label>P&amp;L Basis
+            <select id="pnl-basis-filter">
+              <option value="tp1" selected>TP1 (Default)</option>
+              <option value="tp2">TP2</option>
+              <option value="tp3">TP3</option>
+              <option value="highest_tp">Highest TP</option>
+            </select>
+          </label>
+          <label>From date<input id="signal-date-from" type="date"></label>
+          <label>To date<input id="signal-date-to" type="date"></label>
+          <label>Notification type
+            <select id="notification-type-filter">
+              <option value="all">All Notifications</option>
+              <option value="primary" selected>Primary Notifications</option>
+              <option value="duplicates">Duplicates</option>
+              <option value="updates">Signal Updates</option>
+            </select>
+          </label>
+        </div>
+        <div class="filter-drawer-foot">
+          <button type="button" id="drawer-reset-filters">Reset All Filters</button>
+          <button type="button" class="primary" id="drawer-done-filters">Done</button>
+        </div>
+      </div>
+
+      <div id="signals-pnl-summary" class="pnl-summary-strip sticky-pnl"></div>
       <output id="process-result"></output>
       <div id="signals-list" class="signals-accordion"></div>
     </article>
+
+    <div id="batch-action-bar" class="batch-floating-bar hidden">
+      <span id="batch-count-label" class="batch-count">0 selected</span>
+      <div class="batch-actions">
+        <button type="button" id="select-filtered">Select Visible</button>
+        <button type="button" class="primary" id="process-selected">Process</button>
+        <button type="button" id="reparse-selected">Re-parse</button>
+        <button type="button" id="delete-selected" class="btn-danger">Delete</button>
+        <button type="button" id="clear-selection">Clear</button>
+      </div>
+    </div>
   </section>
 
   <section id="analyzer" class="view">
@@ -249,11 +277,11 @@
         <label>Category hint (optional)
           <select id="parse-category">
             <option value="">Auto-detect</option>
-            <option value="Crypto">Crypto</option>
-            <option value="Forex">Forex</option>
-            <option value="Indian Options">Indian Options</option>
+            <option value="Index Options">Index Options</option>
             <option value="Stock Options">Stock Options</option>
             <option value="MCX">MCX</option>
+            <option value="Forex">Forex</option>
+            <option value="Crypto">Crypto</option>
           </select>
         </label>
       </div>
@@ -454,10 +482,22 @@
   </section>
 </main>
 
-<dialog id="parse-review-dialog">
-  <div class="toolbar"><h2>Parsed signal review</h2><button id="close-parse-review" type="button">Close</button></div>
-  <div id="parse-review"><p class="muted">Loading...</p></div>
-</dialog>
+<div id="review-drawer-backdrop" class="review-drawer-backdrop">
+  <aside id="review-drawer" class="review-drawer" aria-label="Quick Fix &amp; Review Drawer">
+    <div class="review-drawer-head">
+      <div class="review-drawer-title-group">
+        <span id="review-drawer-badge" class="pill badge-orange">Quick Fix</span>
+        <h2 id="review-drawer-title" style="margin:0;font-size:15px">Signal Review</h2>
+      </div>
+      <div class="review-drawer-nav">
+        <button type="button" id="review-prev-btn" class="ch-btn" style="display:none">&larr; Prev</button>
+        <button type="button" id="review-next-btn" class="ch-btn" style="display:none">Next &rarr;</button>
+        <button type="button" id="close-parse-review" class="ch-btn">&#x2715;</button>
+      </div>
+    </div>
+    <div id="parse-review" class="review-drawer-body"><p class="muted">Loading...</p></div>
+  </aside>
+</div>
 
 <div id="lan-auth-overlay" class="auth-overlay">
   <div class="auth-card">

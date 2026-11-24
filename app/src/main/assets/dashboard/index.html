@@ -471,6 +471,24 @@
   </section>
 
   <section id="logs" class="view">
+    <article id="bg-health-article">
+      <div class="toolbar">
+        <div>
+          <h2>Background Activity &amp; Uptime Plot</h2>
+          <p class="muted">Live 15s watchdog heartbeats, Doze/OEM freeze gaps (&gt;45s), and Android OS kill diagnostics.</p>
+        </div>
+        <div class="actions">
+          <div class="bg-win-group" id="bg-health-window-btns">
+            <button type="button" class="ch-btn" data-bg-win="60">1H</button>
+            <button type="button" class="ch-btn active" data-bg-win="360">6H</button>
+            <button type="button" class="ch-btn" data-bg-win="1440">24H</button>
+          </div>
+          <button type="button" id="bg-health-refresh-btn">Refresh</button>
+          <button type="button" id="bg-health-clear-btn">Clear History</button>
+        </div>
+      </div>
+      <div id="bg-health-panel"><p class="muted">Loading background telemetry...</p></div>
+    </article>
     <article>
       <h2>Provider API Errors &amp; Rate-Limit Incidents (24h)</h2>
       <div id="api-incidents-table" class="table-wrap"></div>

@@ -18,6 +18,7 @@ import com.example.domain.model.ParsedSignal
 import com.example.domain.model.SourceNotificationRow
 import com.example.domain.parser.DefaultRulesEngine
 import com.example.domain.parser.SignalParser
+import com.example.service.BackgroundHealthSnapshot
 import com.example.service.NetworkUtils
 import com.example.service.ServiceStatus
 import com.example.service.SignalProcessingService
@@ -69,6 +70,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val repo = container.repository
 
     val serviceStatus: StateFlow<ServiceStatus> = SignalProcessingService.status
+    val backgroundHealth: StateFlow<BackgroundHealthSnapshot> = container.backgroundHealthTracker.snapshot
 
     private val _overview = MutableStateFlow<OverviewData?>(null)
     val overview: StateFlow<OverviewData?> = _overview.asStateFlow()
@@ -628,5 +630,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun rotateLanToken() {
         _lanToken.value = container.lanAuthManager.rotateBearerToken()
         _statusMessage.value = "Access token rotated. Active LAN browser sessions must re-pair."
+    }
+
+    fun refreshBackgroundHealth() = viewModelScope.launch(Dispatchers.IO) {
+        container.backgroundHealthTracker.refreshNow()
+    }
+
+    fun clearBackgroundHealthHistory() = viewModelScope.launch(Dispatchers.IO) {
+        container.backgroundHealthTracker.clearHistory()
+        _statusMessage.value = "Background activity uptime history cleared."
     }
 }

@@ -48,6 +48,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.service.NetworkUtils
+import com.example.ui.components.BackgroundHealthCard
 import com.example.ui.components.QrCodeCard
 import com.example.ui.components.SectionCard
 import com.example.ui.components.StatusPill
@@ -97,16 +98,23 @@ private fun ServerLanTab(
 ) {
     val ctx = LocalContext.current
     val status by viewModel.serviceStatus.collectAsStateWithLifecycle()
+    val bgHealth by viewModel.backgroundHealth.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val lanToken by viewModel.lanToken.collectAsStateWithLifecycle()
     val lanIp by viewModel.lanIp.collectAsStateWithLifecycle()
+
+    LaunchedEffect(Unit) {
+        viewModel.refreshBackgroundHealth()
+    }
 
     var portText by remember { mutableStateOf("8765") }
     LaunchedEffect(settings) {
         settings["lan_port"]?.takeIf { it.isNotBlank() }?.let { portText = it }
     }
     val portInt = (portText.toIntOrNull() ?: 8765).coerceIn(1024, 65535)
-    val ignoringBattery = remember(status.running) { NetworkUtils.isIgnoringBatteryOptimizations(ctx) }
+    val ignoringBattery = remember(status.running, bgHealth.ignoringBatteryOptimizations) {
+        NetworkUtils.isIgnoringBatteryOptimizations(ctx)
+    }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -180,13 +188,35 @@ private fun ServerLanTab(
                     style = MaterialTheme.typography.labelSmall.copy(fontFamily = MonoFontFamily),
                     color = SignalBlue
                 )
+                if (status.lastHeartbeatAt != null) {
+                    Text(
+                        "Last watchdog heartbeat: ${formatShortTimestamp(status.lastHeartbeatAt)}" +
+                            if (status.isSchedulerBusy) " • Verifying signals…" else "",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = EmeraldAccent
+                    )
+                }
                 if (status.lastSchedulerTickAt != null) {
-                    Text("Last scheduler tick: ${formatShortTimestamp(status.lastSchedulerTickAt)}", style = MaterialTheme.typography.labelSmall, color = TextSecondary)
+                    val durSuffix = if (status.lastTickDurationMs > 0L) " (${status.lastTickDurationMs}ms)" else ""
+                    Text(
+                        "Last scheduler tick: ${formatShortTimestamp(status.lastSchedulerTickAt)}$durSuffix",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = TextSecondary
+                    )
                 }
                 if (status.lastError != null) {
                     Text("Error: ${status.lastError}", style = MaterialTheme.typography.bodySmall, color = CoralRed)
                 }
             }
+        }
+
+        item {
+            BackgroundHealthCard(
+                snapshot = bgHealth,
+                isServiceRunning = status.running,
+                onRefresh = { viewModel.refreshBackgroundHealth() },
+                onClearHistory = { viewModel.clearBackgroundHealthHistory() }
+            )
         }
 
         item {

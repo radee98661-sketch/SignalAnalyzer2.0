@@ -398,6 +398,28 @@ pre{white-space:pre-wrap;color:#b9cbef;background:#0b1324;padding:12px;border-ra
 .quota-bar{height:7px;background:#18233c;border-radius:4px;overflow:hidden}
 .quota-bar i{display:block;height:100%;background:var(--accent)}
 
+/* Background Activity & Uptime Plot */
+.bg-win-group{display:inline-flex;gap:4px;align-items:center}
+.bg-win-group .ch-btn.active{background:#142d4c;color:#60a5fa;border-color:#60a5fa}
+.bg-kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:12px 0}
+.bg-kpi{background:#0b1222;border:1px solid #1e2c4a;border-radius:10px;padding:10px 12px}
+.bg-kpi .lbl{font-size:11px;color:var(--muted)}
+.bg-kpi .val{font-size:18px;font-weight:700;font-family:var(--mono,monospace);margin-top:3px}
+.bg-hud{display:flex;justify-content:space-between;align-items:center;gap:10px;background:#0b1222;border:1px solid #1e2c4a;border-radius:8px;padding:7px 10px;font-family:var(--mono,monospace);font-size:12px;margin-bottom:8px}
+.bg-timeline{display:flex;align-items:flex-end;gap:2px;height:84px;background:#09101f;border:1px solid #1e2c4a;border-radius:10px;padding:10px 8px;overflow:hidden}
+.bg-bar{flex:1 1 0;min-width:2px;border-radius:3px 3px 1px 1px;cursor:pointer;transition:opacity .12s,transform .12s}
+.bg-bar:hover{opacity:1!important;transform:scaleY(1.06);outline:1px solid #fff}
+.bg-bar.st-active{background:#62d6a5;height:68%}
+.bg-bar.st-busy{background:#60a5fa;height:84%}
+.bg-bar.st-stalled{background:#ff7285;height:100%;box-shadow:0 0 8px rgba(255,114,133,.45)}
+.bg-bar.st-stopped{background:rgba(255,187,102,.55);height:34%}
+.bg-bar.st-unknown{background:rgba(38,53,84,.55);height:14%}
+.bg-axis{display:flex;justify-content:space-between;font-family:var(--mono,monospace);font-size:11px;color:var(--muted);margin:5px 2px 10px}
+.bg-legend{display:flex;flex-wrap:wrap;gap:14px;font-size:12px;color:var(--muted);margin-bottom:12px}
+.bg-legend span{display:inline-flex;align-items:center;gap:6px}
+.bg-dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+.bg-os-banner{background:rgba(255,114,133,.12);border:1px solid rgba(255,114,133,.4);color:#ffd0d7;border-radius:9px;padding:9px 12px;font-size:12px;margin-bottom:12px}
+
 @media(max-width:760px){
   body{display:block}
   aside{width:100%;min-height:auto;position:sticky;top:0;z-index:30;padding:10px 12px;border-right:0;border-bottom:1px solid var(--line)}

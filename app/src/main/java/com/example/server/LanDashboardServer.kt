@@ -12,6 +12,7 @@ import com.example.domain.model.DefaultSlCategoryRule
 import com.example.domain.model.SourceNotificationRow
 import com.example.domain.parser.DefaultRulesEngine
 import com.example.domain.parser.SignalParser
+import com.example.service.BackgroundHealthTracker
 import com.example.util.JsonUtils
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
@@ -67,7 +68,8 @@ class LanDashboardServer(
     private val assetLoader: (String) -> ByteArray?,
     private val runtimeStatusProvider: () -> ServerRuntimeInfo = {
         ServerRuntimeInfo(running = true, bindHost = "127.0.0.1", port = 0, lanEnabled = false, activeWsClients = 0)
-    }
+    },
+    private val backgroundHealthTracker: BackgroundHealthTracker? = null
 ) {
     private var engine: ApplicationEngine? = null
     private var currentHost: String = "127.0.0.1"
@@ -227,6 +229,69 @@ class LanDashboardServer(
                     put("dedicated_processing_enabled", info.dedicatedProcessingEnabled)
                 }
             )
+        }
+
+        get("/service/health") {
+            if (!call.requireAuth()) return@get
+            val tracker = backgroundHealthTracker
+            if (tracker == null) {
+                call.respondJson(JSONObject().put("available", false))
+                return@get
+            }
+            tracker.refreshNow()
+            val snap = tracker.snapshot.value
+            val info = runtimeStatusProvider()
+            val bucketsArr = JSONArray()
+            snap.buckets.forEach { b ->
+                bucketsArr.put(
+                    JSONObject().apply {
+                        put("minute_epoch", b.minuteEpoch)
+                        put("status", b.status.name.lowercase(Locale.US))
+                        put("max_tick_ms", b.maxTickDurationMs)
+                        put("gap_seconds", b.gapSeconds)
+                    }
+                )
+            }
+            val incArr = JSONArray()
+            snap.incidents.forEach { inc ->
+                incArr.put(
+                    JSONObject().apply {
+                        put("id", inc.id)
+                        put("kind", inc.kind)
+                        put("started_at_ms", inc.startedAtMs)
+                        put("ended_at_ms", inc.endedAtMs)
+                        put("duration_sec", inc.durationSec)
+                        put("detail", inc.detail)
+                    }
+                )
+            }
+            call.respondJson(
+                JSONObject().apply {
+                    put("available", true)
+                    put("service_running", info.running)
+                    put("expected_running", snap.expectedRunning)
+                    put("last_heartbeat_ms", snap.lastHeartbeatMs ?: JSONObject.NULL)
+                    put("last_scheduler_tick_ms", snap.lastSchedulerTickMs ?: JSONObject.NULL)
+                    put("last_scheduler_duration_ms", snap.lastSchedulerDurationMs)
+                    put("is_scheduler_busy", snap.isSchedulerBusy)
+                    put("live_stall_seconds", snap.liveStallSeconds)
+                    put("uptime_24h_pct", snap.uptime24hPct)
+                    put("active_minutes_24h", snap.activeMinutes24h)
+                    put("downtime_seconds_24h", snap.downtimeSeconds24h)
+                    put("longest_gap_seconds_24h", snap.longestGapSeconds24h)
+                    put("outage_count_24h", snap.outageCount24h)
+                    put("last_os_exit_reason", snap.lastOsExitReason ?: JSONObject.NULL)
+                    put("ignoring_battery_optimizations", snap.ignoringBatteryOptimizations)
+                    put("buckets", bucketsArr)
+                    put("incidents", incArr)
+                }
+            )
+        }
+
+        post("/service/health/clear") {
+            if (!call.requireAuth()) return@post
+            backgroundHealthTracker?.clearHistory()
+            call.respondJson(JSONObject().put("ok", true))
         }
 
         get("/overview") {

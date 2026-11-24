@@ -14,6 +14,7 @@ import com.example.data.repository.VerificationService
 import com.example.server.LanAuthManager
 import com.example.server.LanDashboardServer
 import com.example.server.ServerRuntimeInfo
+import com.example.service.BackgroundHealthTracker
 import com.example.service.ReconciliationWorker
 import com.example.service.SignalProcessingService
 import kotlinx.coroutines.CoroutineScope
@@ -29,6 +30,7 @@ class AppContainer(app: Application) {
     val ingestionService = SignalIngestionService(db, eventBus)
     val verificationService = VerificationService(db, secretStore, providers, eventBus)
     val syncClient = GoogleSheetsSyncClient(db, secretStore, ingestionService, eventBus)
+    val backgroundHealthTracker = BackgroundHealthTracker(app, db)
     val repository = SignalRepository(
         context = app,
         db = db,
@@ -60,7 +62,8 @@ class AppContainer(app: Application) {
                 activeWsClients = st.activeWsClients,
                 dedicatedProcessingEnabled = st.dedicatedProcessingEnabled
             )
-        }
+        },
+        backgroundHealthTracker = backgroundHealthTracker
     )
     val legacyImporter = LegacySqliteImporter(app, db)
 }
@@ -77,6 +80,7 @@ class SignalAnalyzerApp : Application() {
         appScope.launch {
             try {
                 container.db.initializeDefaults()
+                container.backgroundHealthTracker.ensureLoaded()
                 container.verificationService.reconcileOnStartup()
             } catch (_: Exception) {
             }

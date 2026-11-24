@@ -16,6 +16,7 @@ import com.example.R
 import com.example.SignalAnalyzerApp
 import com.example.domain.model.AppEvent
 import com.example.util.TimeUtils
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -27,6 +28,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import java.util.concurrent.atomic.AtomicBoolean
 
 data class ServiceStatus(
     val running: Boolean = false,
@@ -37,6 +40,9 @@ data class ServiceStatus(
     val lanIp: String = "127.0.0.1",
     val activeWsClients: Int = 0,
     val lastSchedulerTickAt: String? = null,
+    val lastHeartbeatAt: String? = null,
+    val lastTickDurationMs: Long = 0L,
+    val isSchedulerBusy: Boolean = false,
     val lastSyncAt: String? = null,
     val lastError: String? = null
 ) {
@@ -49,12 +55,19 @@ class SignalProcessingService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var schedulerJob: Job? = null
     private var syncJob: Job? = null
+    private var watchdogJob: Job? = null
     private var statusPollJob: Job? = null
+    private val stoppedByUser = AtomicBoolean(false)
+    @Volatile
+    private var currentBusyLabel: String? = null
+    @Volatile
+    private var startupLanError: String? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            stoppedByUser.set(true)
             stopAllAndSelf()
             return START_NOT_STICKY
         }
@@ -64,10 +77,12 @@ class SignalProcessingService : Service() {
         val port = (intent?.getIntExtra(EXTRA_PORT, _status.value.port) ?: 8765).coerceIn(1024, 65535)
 
         if (!dedicated && !lanEnabled) {
+            stoppedByUser.set(true)
             stopAllAndSelf()
             return START_NOT_STICKY
         }
 
+        stoppedByUser.set(false)
         createNotificationChannel()
         val lanIp = NetworkUtils.getLocalLanIpv4()
         val bindHost = if (lanEnabled) "0.0.0.0" else "127.0.0.1"
@@ -80,97 +95,181 @@ class SignalProcessingService : Service() {
         }
 
         val container = (application as SignalAnalyzerApp).container
-        var startupError: String? = null
+        var lanErr: String? = null
         if (lanEnabled) {
             try {
-                container.lanServer.start(bindHost, port)
+                if (!container.lanServer.isRunning() || _status.value.port != port || _status.value.bindHost != bindHost) {
+                    container.lanServer.start(bindHost, port)
+                }
             } catch (e: Exception) {
-                startupError = "LAN server bind error on port $port: ${e.message?.take(120)}"
+                lanErr = "LAN server bind error on port $port: ${e.message?.take(120)}"
             }
         } else {
             container.lanServer.stop()
         }
+        startupLanError = lanErr
 
+        val wasRunning = _status.value.running
         _status.value = _status.value.copy(
             running = true,
             dedicatedProcessingEnabled = dedicated,
-            lanDashboardEnabled = lanEnabled && startupError == null,
+            lanDashboardEnabled = lanEnabled && lanErr == null,
             bindHost = bindHost,
             port = port,
             lanIp = lanIp,
             activeWsClients = container.lanServer.activeWsClientCount(),
-            lastError = startupError
+            lastHeartbeatAt = TimeUtils.utcNowIso(),
+            lastError = lanErr
         )
         container.eventBus.emit(AppEvent("server.status", null, "running", _status.value.lanUrl, TimeUtils.utcNowIso()))
+
+        if (!wasRunning) {
+            serviceScope.launch {
+                container.backgroundHealthTracker.onServiceStarted(dedicated, lanEnabled)
+            }
+        }
 
         startLoops(dedicated)
         return START_STICKY
     }
 
     private fun startLoops(dedicated: Boolean) {
-        schedulerJob?.cancel()
-        syncJob?.cancel()
-        statusPollJob?.cancel()
-
         val container = (application as SignalAnalyzerApp).container
 
         if (dedicated) {
-            schedulerJob = serviceScope.launch {
-                try {
-                    container.verificationService.reconcileOnStartup()
-                } catch (_: Exception) {
-                }
-                while (isActive) {
+            if (schedulerJob?.isActive != true) {
+                schedulerJob = serviceScope.launch {
                     try {
-                        container.verificationService.runDueSchedules()
-                        _status.value = _status.value.copy(lastSchedulerTickAt = TimeUtils.utcNowIso())
-                    } catch (e: Exception) {
-                        _status.value = _status.value.copy(lastError = e.message?.take(140))
+                        currentBusyLabel = "Startup reconciliation"
+                        container.backgroundHealthTracker.setSchedulerBusy(true, currentBusyLabel)
+                        container.verificationService.reconcileOnStartup()
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                    } finally {
+                        currentBusyLabel = null
                     }
-                    delay(10_000L)
+                    while (isActive) {
+                        val startedMs = System.currentTimeMillis()
+                        try {
+                            currentBusyLabel = "Verifying due signals"
+                            _status.value = _status.value.copy(isSchedulerBusy = true)
+                            container.backgroundHealthTracker.setSchedulerBusy(true, currentBusyLabel)
+                            container.verificationService.runDueSchedules()
+                            val elapsedMs = (System.currentTimeMillis() - startedMs).coerceAtLeast(0L)
+                            container.backgroundHealthTracker.onSchedulerTickCompleted(elapsedMs)
+                            _status.value = _status.value.copy(
+                                lastSchedulerTickAt = TimeUtils.utcNowIso(),
+                                lastTickDurationMs = elapsedMs,
+                                isSchedulerBusy = false,
+                                lastError = startupLanError
+                            )
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            _status.value = _status.value.copy(
+                                isSchedulerBusy = false,
+                                lastError = e.message?.take(140) ?: e::class.java.simpleName
+                            )
+                        } finally {
+                            currentBusyLabel = null
+                        }
+                        delay(10_000L)
+                    }
                 }
             }
 
-            syncJob = serviceScope.launch {
-                while (isActive) {
-                    var waitSec = 30L
-                    try {
-                        val settings = container.repository.getSettings()
-                        waitSec = (settings["sync_interval_seconds"]?.toLongOrNull() ?: 30L).coerceAtLeast(5L)
-                        val autoSync = (settings["google_sheets_auto_sync"] ?: "false").equals("true", ignoreCase = true)
-                        if (autoSync) {
-                            container.syncClient.syncGoogleSheets()
-                            _status.value = _status.value.copy(lastSyncAt = TimeUtils.utcNowIso())
+            if (syncJob?.isActive != true) {
+                syncJob = serviceScope.launch {
+                    while (isActive) {
+                        var waitSec = 30L
+                        try {
+                            val settings = container.repository.getSettings()
+                            waitSec = (settings["sync_interval_seconds"]?.toLongOrNull() ?: 30L).coerceAtLeast(5L)
+                            val autoSync = (settings["google_sheets_auto_sync"] ?: "false").equals("true", ignoreCase = true)
+                            if (autoSync) {
+                                container.syncClient.syncGoogleSheets()
+                                _status.value = _status.value.copy(lastSyncAt = TimeUtils.utcNowIso())
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
                         }
+                        delay(waitSec * 1000L)
+                    }
+                }
+            }
+        } else {
+            schedulerJob?.cancel()
+            schedulerJob = null
+            syncJob?.cancel()
+            syncJob = null
+            _status.value = _status.value.copy(isSchedulerBusy = false)
+        }
+
+        // Independent lightweight watchdog heartbeat so slow API calls never masquerade as an OS kill/freeze.
+        if (watchdogJob?.isActive != true) {
+            watchdogJob = serviceScope.launch {
+                while (isActive) {
+                    try {
+                        val busy = _status.value.isSchedulerBusy
+                        container.backgroundHealthTracker.recordHeartbeat(busy = busy, workLabel = currentBusyLabel)
+                        _status.value = _status.value.copy(lastHeartbeatAt = TimeUtils.utcNowIso())
+                    } catch (e: CancellationException) {
+                        throw e
                     } catch (_: Exception) {
                     }
-                    delay(waitSec * 1000L)
+                    delay(BackgroundHealthTracker.HEARTBEAT_INTERVAL_MS)
                 }
             }
         }
 
-        statusPollJob = serviceScope.launch {
-            while (isActive) {
-                val lanIp = NetworkUtils.getLocalLanIpv4()
-                val clients = container.lanServer.activeWsClientCount()
-                if (_status.value.lanIp != lanIp || _status.value.activeWsClients != clients) {
-                    _status.value = _status.value.copy(lanIp = lanIp, activeWsClients = clients)
+        if (statusPollJob?.isActive != true) {
+            statusPollJob = serviceScope.launch {
+                while (isActive) {
+                    try {
+                        val lanIp = NetworkUtils.getLocalLanIpv4()
+                        val clients = container.lanServer.activeWsClientCount()
+                        if (_status.value.lanIp != lanIp || _status.value.activeWsClients != clients) {
+                            _status.value = _status.value.copy(lanIp = lanIp, activeWsClients = clients)
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                    }
+                    delay(4_000L)
                 }
-                delay(4_000L)
             }
         }
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        val container = (application as? SignalAnalyzerApp)?.container
+        if (container != null && _status.value.running) {
+            serviceScope.launch {
+                container.backgroundHealthTracker.onTaskRemoved()
+            }
+        }
+        super.onTaskRemoved(rootIntent)
     }
 
     private fun stopAllAndSelf() {
         schedulerJob?.cancel()
         syncJob?.cancel()
+        watchdogJob?.cancel()
         statusPollJob?.cancel()
         val container = (application as? SignalAnalyzerApp)?.container
         container?.lanServer?.stop()
+        if (container != null) {
+            runBlocking(Dispatchers.IO) {
+                runCatching { container.backgroundHealthTracker.onServiceStoppedByUser() }
+            }
+        }
         _status.value = _status.value.copy(
             running = false,
             dedicatedProcessingEnabled = false,
             lanDashboardEnabled = false,
+            isSchedulerBusy = false,
             activeWsClients = 0
         )
         container?.eventBus?.emit(AppEvent("server.status", null, "stopped", null, TimeUtils.utcNowIso()))
@@ -181,9 +280,22 @@ class SignalProcessingService : Service() {
     override fun onDestroy() {
         schedulerJob?.cancel()
         syncJob?.cancel()
+        watchdogJob?.cancel()
         statusPollJob?.cancel()
-        (application as? SignalAnalyzerApp)?.container?.lanServer?.stop()
-        _status.value = _status.value.copy(running = false, dedicatedProcessingEnabled = false, lanDashboardEnabled = false, activeWsClients = 0)
+        val container = (application as? SignalAnalyzerApp)?.container
+        container?.lanServer?.stop()
+        if (container != null && !stoppedByUser.get() && _status.value.running) {
+            runBlocking(Dispatchers.IO) {
+                runCatching { container.backgroundHealthTracker.onServiceDestroyedUnexpectedly() }
+            }
+        }
+        _status.value = _status.value.copy(
+            running = false,
+            dedicatedProcessingEnabled = false,
+            lanDashboardEnabled = false,
+            isSchedulerBusy = false,
+            activeWsClients = 0
+        )
         serviceScope.cancel()
         super.onDestroy()
     }

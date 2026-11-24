@@ -27,6 +27,9 @@ class ReconciliationWorker(
         val container = app.container
         return try {
             container.db.initializeDefaults()
+            container.backgroundHealthTracker.onReconciliationWorkerRun(
+                isForegroundRunning = SignalProcessingService.status.value.running
+            )
             container.verificationService.reconcileOnStartup()
 
             val settings = container.repository.getSettings()

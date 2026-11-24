@@ -1498,8 +1498,165 @@ async function loadAnalytics() {
   $('#analytics-table').innerHTML = table(formatted, ['Channel', 'Total', 'Win %', 'TP1+', 'TP2+', 'TP3+', 'All TPs', 'TP→SL', 'SL Only', `${basisLbl} INR`, `${basisLbl} USD`, 'Today TP/SL']);
 }
 
+let bgHealthWindowMins = 360;
+let lastBgHealthData = null;
+
+function fmtBgDuration(sec) {
+  const s = Math.max(0, Math.floor(sec || 0));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const r = s % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${r}s`;
+  return `${r}s`;
+}
+
+function fmtBgTime(ms, withDate) {
+  if (!ms) return '—';
+  const d = new Date(ms);
+  return withDate
+    ? d.toLocaleString(undefined, { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    : d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+}
+
+function renderBackgroundHealth(data) {
+  const panel = $('#bg-health-panel');
+  if (!panel) return;
+  if (!data || !data.available) {
+    panel.innerHTML = '<p class="muted">Background watchdog telemetry is unavailable.</p>';
+    return;
+  }
+  const nowMs = Date.now();
+  const winMins = bgHealthWindowMins;
+  const slotMins = winMins <= 60 ? 1 : (winMins <= 360 ? 5 : 15);
+  const slotCount = Math.floor(winMins / slotMins);
+  const endMin = Math.floor(nowMs / 60000);
+  const startMin = endMin - winMins + 1;
+  const bucketMap = new Map((data.buckets || []).map(b => [b.minute_epoch, b]));
+  const liveStallStartMin = (data.expected_running && data.last_heartbeat_ms && (nowMs - data.last_heartbeat_ms) > 45000)
+    ? Math.floor(data.last_heartbeat_ms / 60000)
+    : Number.MAX_SAFE_INTEGER;
+
+  const slots = [];
+  for (let i = 0; i < slotCount; i++) {
+    const sMin = startMin + i * slotMins;
+    const eMin = sMin + slotMins - 1;
+    let st = 'unknown', maxGap = 0, maxTick = 0;
+    for (let m = sMin; m <= eMin; m++) {
+      const b = bucketMap.get(m);
+      const cur = b ? b.status : (m >= liveStallStartMin && m <= endMin ? 'stalled' : 'unknown');
+      if (b) {
+        maxGap = Math.max(maxGap, b.gap_seconds || 0);
+        maxTick = Math.max(maxTick, b.max_tick_ms || 0);
+      }
+      if (st === 'stalled' || cur === 'stalled') st = 'stalled';
+      else if (st === 'busy' || cur === 'busy') st = 'busy';
+      else if (st === 'active' || cur === 'active') st = 'active';
+      else if (st === 'stopped' || cur === 'stopped') st = 'stopped';
+    }
+    slots.push({ startMs: sMin * 60000, endMs: (eMin + 1) * 60000, status: st, maxGap, maxTick });
+  }
+
+  const uptimePct = Number(data.uptime_24h_pct ?? 100);
+  const uptimeCls = uptimePct >= 98 ? 'green' : (uptimePct >= 90 ? 'amber' : 'red');
+  const outages = Number(data.outage_count_24h || 0);
+  const hbAgeSec = data.last_heartbeat_ms ? Math.max(0, Math.floor((nowMs - data.last_heartbeat_ms) / 1000)) : null;
+  const liveStatus = (data.live_stall_seconds > 0)
+    ? `<span class="pill badge-red">STALLED (${fmtBgDuration(data.live_stall_seconds)})</span>`
+    : (data.service_running
+      ? `<span class="pill badge-green">HEALTHY${hbAgeSec !== null ? ` • ${hbAgeSec}s ago` : ''}</span>`
+      : `<span class="pill badge-orange">STOPPED</span>`);
+
+  const barsHtml = slots.map((s, idx) =>
+    `<div class="bg-bar st-${s.status}" data-slot-idx="${idx}" title="${fmtBgTime(s.startMs, false)}–${fmtBgTime(s.endMs, false)} • ${s.status.toUpperCase()}"></div>`
+  ).join('');
+
+  const osBanner = data.last_os_exit_reason
+    ? `<div class="bg-os-banner"><strong>Last Android OS Process Termination:</strong> ${esc(data.last_os_exit_reason)}</div>`
+    : '';
+
+  const incRows = (data.incidents || []).slice(0, 30).map(inc => ({
+    Type: inc.kind.replace(/_/g, ' ').toUpperCase(),
+    'Went Inactive': fmtBgTime(inc.started_at_ms, true),
+    Resumed: inc.ended_at_ms > inc.started_at_ms ? fmtBgTime(inc.ended_at_ms, true) : '—',
+    Duration: inc.duration_sec > 0 ? fmtBgDuration(inc.duration_sec) : '—',
+    Detail: inc.detail
+  }));
+
+  const winLabel = winMins <= 60 ? '1h' : (winMins <= 360 ? '6h' : '24h');
+  const midLabel = winMins <= 60 ? '-30m' : (winMins <= 360 ? '-3h' : '-12h');
+
+  panel.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+      <div>${liveStatus}</div>
+      <div class="muted" style="font-size:12px">Last pulse: ${fmtBgTime(data.last_heartbeat_ms, true)}${data.last_scheduler_duration_ms ? ` • Last verify: ${data.last_scheduler_duration_ms}ms` : ''}</div>
+    </div>
+    <div class="bg-kpi-grid">
+      <div class="bg-kpi"><div class="lbl">24h Uptime</div><div class="val ${uptimeCls}">${uptimePct.toFixed(1)}%</div></div>
+      <div class="bg-kpi"><div class="lbl">Stalls / OS Kills (24h)</div><div class="val ${outages > 0 ? 'red' : 'green'}">${outages}</div></div>
+      <div class="bg-kpi"><div class="lbl">Total Downtime (24h)</div><div class="val ${data.downtime_seconds_24h > 0 ? 'red' : ''}">${fmtBgDuration(data.downtime_seconds_24h)}</div></div>
+      <div class="bg-kpi"><div class="lbl">OS Battery Mode</div><div class="val ${data.ignoring_battery_optimizations ? 'green' : 'amber'}">${data.ignoring_battery_optimizations ? 'Unrestricted' : 'Optimized'}</div></div>
+    </div>
+    <div class="bg-hud" id="bg-health-hud">
+      <span>Hover any timeline bar to inspect exact minute status &amp; gap duration</span>
+      <span class="muted">Max gap: ${fmtBgDuration(data.longest_gap_seconds_24h)}</span>
+    </div>
+    <div class="bg-timeline" id="bg-health-timeline">${barsHtml}</div>
+    <div class="bg-axis"><span>-${winLabel}</span><span>${midLabel}</span><span>Now (${fmtBgTime(nowMs, false)})</span></div>
+    <div class="bg-legend">
+      <span><i class="bg-dot" style="background:#62d6a5"></i>Active</span>
+      <span><i class="bg-dot" style="background:#60a5fa"></i>Busy / Slow Verify</span>
+      <span><i class="bg-dot" style="background:#ff7285"></i>Stalled / Freeze / OS Killed</span>
+      <span><i class="bg-dot" style="background:rgba(255,187,102,.65)"></i>Stopped</span>
+    </div>
+    ${osBanner}
+    <h3 style="margin:6px 0 8px;font-size:13px">Recorded Stalls, OS Kills &amp; Lifecycle Events (${(data.incidents || []).length})</h3>
+    <div class="table-wrap">${incRows.length ? table(incRows, ['Type', 'Went Inactive', 'Resumed', 'Duration', 'Detail']) : '<p class="muted">No stalls or unexpected kills recorded yet.</p>'}</div>
+  `;
+
+  const tl = $('#bg-health-timeline');
+  const hud = $('#bg-health-hud');
+  if (tl && hud) {
+    tl.addEventListener('mouseover', ev => {
+      const bar = ev.target.closest('.bg-bar');
+      if (!bar) return;
+      const s = slots[Number(bar.dataset.slotIdx)];
+      if (!s) return;
+      const metric = s.maxGap > 0 ? `Gap ${fmtBgDuration(s.maxGap)}` : (s.maxTick > 0 ? `Tick ${s.maxTick}ms` : 'Normal');
+      hud.innerHTML = `<span>${fmtBgTime(s.startMs, false)}–${fmtBgTime(s.endMs, false)} • <strong>${s.status.toUpperCase()}</strong></span><span class="muted">${metric}</span>`;
+    });
+  }
+}
+
+async function loadBackgroundHealth() {
+  try {
+    lastBgHealthData = await api('/api/v1/service/health');
+    renderBackgroundHealth(lastBgHealthData);
+  } catch (_) {}
+}
+
+if ($('#bg-health-window-btns')) {
+  $('#bg-health-window-btns').addEventListener('click', ev => {
+    const btn = ev.target.closest('[data-bg-win]');
+    if (!btn) return;
+    bgHealthWindowMins = Number(btn.dataset.bgWin) || 360;
+    $('#bg-health-window-btns').querySelectorAll('.ch-btn').forEach(b => b.classList.toggle('active', b === btn));
+    if (lastBgHealthData) renderBackgroundHealth(lastBgHealthData);
+  });
+}
+if ($('#bg-health-refresh-btn')) $('#bg-health-refresh-btn').onclick = () => loadBackgroundHealth();
+if ($('#bg-health-clear-btn')) {
+  $('#bg-health-clear-btn').onclick = async () => {
+    await api('/api/v1/service/health/clear', { method: 'POST' });
+    await loadBackgroundHealth();
+  };
+}
+
 async function loadLogs() {
-  await loadApiHealth().catch(() => {});
+  await Promise.all([
+    loadBackgroundHealth().catch(() => {}),
+    loadApiHealth().catch(() => {})
+  ]);
   $('#logs-table').innerHTML = table(await api('/api/v1/logs'), ['created_at', 'severity', 'source', 'message']);
 }
 

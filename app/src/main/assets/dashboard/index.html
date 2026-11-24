@@ -11,6 +11,7 @@
   <div class="brand">SIGNAL<br><small>ANALYZER</small></div>
   <nav>
     <button class="active" data-view="overview">Overview</button>
+    <button data-view="inbox">Channel Inbox</button>
     <button data-view="integrations">Integrations &amp; API</button>
     <button data-view="signals">Signal Management</button>
     <button data-view="analyzer">Signal Analyzer</button>
@@ -39,12 +40,70 @@
   <div id="api-health-banner" class="api-alert-banner" style="display:none"></div>
 
   <section id="overview" class="view active">
+    <div class="overview-scope-bar">
+      <div id="overview-category-tabs" class="overview-cat-tabs" role="tablist" aria-label="Filter overview by category"></div>
+      <span id="overview-scope-badge" class="pill badge-blue">All Categories</span>
+    </div>
     <div id="metrics" class="metrics"></div>
     <div class="grid">
-      <article><h2>Category distribution</h2><div id="categories" class="bars"></div></article>
-      <article><h2>Channel distribution</h2><div id="channels" class="bars"></div></article>
+      <article>
+        <div class="card-head-inline">
+          <h2>Category distribution</h2>
+          <span class="muted" style="font-size:11px">Click any category to inspect</span>
+        </div>
+        <div id="categories" class="bars"></div>
+      </article>
+      <article>
+        <div class="card-head-inline">
+          <h2 id="overview-channels-title">Channel contribution</h2>
+          <span id="overview-channels-sub" class="muted" style="font-size:11px"></span>
+        </div>
+        <div id="channels" class="bars"></div>
+      </article>
     </div>
-    <article><h2>Recent parsed signals</h2><div id="recent-signals" class="table-wrap"></div></article>
+    <article>
+      <div class="card-head-inline">
+        <h2 id="overview-recent-title">Recent parsed signals</h2>
+        <span id="overview-recent-sub" class="muted" style="font-size:11px"></span>
+      </div>
+      <div id="recent-signals" class="table-wrap"></div>
+    </article>
+  </section>
+
+  <section id="inbox" class="view">
+    <div id="inbox-shell" class="inbox-shell">
+      <div class="inbox-sidebar">
+        <div class="inbox-sidebar-head">
+          <div class="inbox-sidebar-title-row">
+            <h2>Channels</h2>
+            <div style="display:flex;align-items:center;gap:6px">
+              <span id="inbox-channel-count" class="muted" style="font-size:11px">0 chats</span>
+              <button type="button" id="inbox-refresh-btn" class="ch-btn" title="Refresh channels">Refresh</button>
+            </div>
+          </div>
+          <div id="inbox-category-pills" class="inbox-cat-pills" role="tablist" aria-label="Filter chats by category"></div>
+          <input id="inbox-channel-search" class="inbox-search-input" type="search" placeholder="Search channels..." autocomplete="off">
+        </div>
+        <div id="inbox-channel-list" class="inbox-channel-list">
+          <p class="muted" style="padding:16px">Loading channels...</p>
+        </div>
+      </div>
+
+      <div class="inbox-chat">
+        <div id="inbox-chat-header" class="inbox-chat-header">
+          <div class="inbox-chat-empty-head">
+            <span class="muted">Select a channel to open message history</span>
+          </div>
+        </div>
+        <div id="inbox-messages" class="inbox-messages">
+          <div class="inbox-empty-state">
+            <div class="inbox-empty-icon">&#128172;</div>
+            <h3>Telegram-Style Channel Inbox</h3>
+            <p class="muted">Pick any category and channel on the left to inspect every received signal, copy raw text in one click, and cross-check the Parsed Summary box.</p>
+          </div>
+        </div>
+      </div>
+    </div>
   </section>
 
   <section id="notifications" class="view">

@@ -14,6 +14,18 @@ data class NamedCount(
     val value: Int
 )
 
+data class InboxChannelSummaryRow(
+    val channel: String?,
+    val category: String?,
+    @ColumnInfo(name = "total_messages") val totalMessages: Int,
+    @ColumnInfo(name = "today_messages") val todayMessages: Int,
+    @ColumnInfo(name = "parsed_count") val parsedCount: Int,
+    @ColumnInfo(name = "needs_review_count") val needsReviewCount: Int,
+    @ColumnInfo(name = "last_message") val lastMessage: String?,
+    @ColumnInfo(name = "last_time") val lastTime: String?,
+    @ColumnInfo(name = "last_raw_id") val lastRawId: Long
+)
+
 data class SignalJoinedRow(
     val id: Long,
     @ColumnInfo(name = "raw_notification_id") val rawNotificationId: Long,
@@ -343,6 +355,21 @@ interface CoreDao {
 
     @RawQuery
     suspend fun queryNotificationsJoined(query: SupportSQLiteQuery): List<NotificationJoinedRow>
+
+    @RawQuery
+    suspend fun queryInt(query: SupportSQLiteQuery): Int
+
+    @RawQuery
+    suspend fun queryDouble(query: SupportSQLiteQuery): Double
+
+    @RawQuery
+    suspend fun queryNamedCounts(query: SupportSQLiteQuery): List<NamedCount>
+
+    @RawQuery
+    suspend fun queryRawNotifications(query: SupportSQLiteQuery): List<RawNotificationEntity>
+
+    @RawQuery
+    suspend fun queryInboxChannelSummaries(query: SupportSQLiteQuery): List<InboxChannelSummaryRow>
 
     @Query(
         "SELECT s.*, r.received_at, r.notification_time, r.source_app, r.channel, r.category, r.title, r.message, " +

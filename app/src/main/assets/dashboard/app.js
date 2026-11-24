@@ -99,6 +99,7 @@ function connectWebSocket() {
 function refreshActiveView() {
   if (!authSessionToken) return;
   if (currentView === 'overview') overview().catch(() => {});
+  else if (currentView === 'inbox') refreshInboxView().catch(() => {});
   else if (currentView === 'signals') loadSignals().catch(() => {});
   else if (currentView === 'notifications') notificationLog().catch(() => {});
   else if (currentView === 'market') { loadApiHealth().catch(() => {}); coverage().catch(() => {}); }
@@ -1154,17 +1155,455 @@ async function notificationLog() {
   $('#notification-status').textContent = `Showing ${items.length} stored messages`;
 }
 
-async function overview() {
-  let x = await api('/api/v1/overview'), m = x.metrics;
-  $('#metrics').innerHTML = Object.entries({
-    Notifications: m.notifications, 'Parsed signals': m.parsed, Pending: m.pending,
-    'Target hits': m.target_hits, 'Stop-loss hits': m.stop_loss_hits, 'Win rate': m.win_rate + '%',
-    'P&L (INR)': fmtPnl(m.pnl_inr, 'INR'), 'P&L (USD)': fmtPnl(m.pnl_usd, 'USD'),
-  }).map(([k, v]) => `<div class="metric"><span>${k}</span><b>${esc(v)}</b></div>`).join('');
-  $('#categories').innerHTML = bars(x.categories || []);
-  $('#channels').innerHTML = bars(x.channels || []);
-  $('#recent-signals').innerHTML = table(x.recent_signals || [], ['id', 'channel', 'symbol', 'direction', 'entry_price', 'verification_status']);
+let overviewCategory = '';
+
+function formatParsedSummaryLine(x) {
+  if (!x || !x.signal_id) return 'Not parsed';
+  const eList = [x.entry_price, ...(x.additional_entries || [])].filter(v => v != null);
+  const entryStr = eList.length ? eList.join('/') : (x.entry_mode === 'market_now' ? 'MARKET NOW' : '—');
+  return `${x.symbol || '—'} ${x.direction || ''} | E: ${entryStr} | SL: ${x.stop_loss ?? '—'} | TP: ${(x.targets || []).join('/') || '—'}`;
 }
+
+async function copyTextWithFallback(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (_) {}
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function overview() {
+  const qs = overviewCategory ? '?category=' + encodeURIComponent(overviewCategory) : '';
+  const x = await api('/api/v1/overview' + qs);
+  const m = x.metrics || {};
+  const cats = x.categories || [];
+  const totalAllCats = cats.reduce((acc, c) => acc + Number(c.value || 0), 0);
+
+  // Category tab bar
+  const tabsHost = $('#overview-category-tabs');
+  if (tabsHost) {
+    tabsHost.innerHTML = [
+      `<button type="button" class="ov-cat-tab ${overviewCategory === '' ? 'active' : ''}" data-ov-cat="">All Categories <span class="ov-tab-cnt">${totalAllCats}</span></button>`,
+      ...cats.map(c => `<button type="button" class="ov-cat-tab ${overviewCategory === c.name ? 'active' : ''}" data-ov-cat="${esc(c.name)}">${esc(c.name)} <span class="ov-tab-cnt">${Number(c.value || 0)}</span></button>`)
+    ].join('');
+    tabsHost.querySelectorAll('[data-ov-cat]').forEach(btn => {
+      btn.onclick = () => {
+        overviewCategory = btn.dataset.ovCat || '';
+        overview().catch(() => {});
+      };
+    });
+  }
+
+  const scopeLabel = overviewCategory || 'All Categories';
+  if ($('#overview-scope-badge')) $('#overview-scope-badge').textContent = scopeLabel;
+
+  const parseRate = m.notifications > 0 ? Math.round((Number(m.parsed || 0) / Number(m.notifications || 1)) * 100) : 0;
+  const pnlInrCls = Number(m.pnl_inr || 0) >= 0 ? 'green' : 'red';
+  const pnlUsdCls = Number(m.pnl_usd || 0) >= 0 ? 'green' : 'red';
+
+  const metricCards = [
+    {
+      label: overviewCategory ? `Today (${overviewCategory})` : 'Today’s Signals',
+      value: m.today ?? 0,
+      sub: `${m.today_parsed ?? 0} parsed perfectly today`,
+      cls: 'metric-today'
+    },
+    { label: 'Notifications', value: m.notifications ?? 0, sub: 'Primary messages' },
+    { label: 'Parsed Perfectly', value: m.parsed ?? 0, sub: `${parseRate}% parse accuracy` },
+    { label: 'Pending', value: m.pending ?? 0, sub: 'Awaiting outcome' },
+    { label: 'Target Hits', value: m.target_hits ?? 0, valCls: 'green' },
+    { label: 'Stop-Loss Hits', value: m.stop_loss_hits ?? 0, valCls: 'red' },
+    { label: 'Win Rate', value: (m.win_rate ?? 0) + '%', valCls: 'amber' },
+    { label: 'P&L (INR)', value: fmtPnl(m.pnl_inr, 'INR'), valCls: pnlInrCls },
+    { label: 'P&L (USD)', value: fmtPnl(m.pnl_usd, 'USD'), valCls: pnlUsdCls },
+  ];
+  $('#metrics').innerHTML = metricCards.map(c =>
+    `<div class="metric ${c.cls || ''}"><span>${esc(c.label)}</span><b class="${c.valCls || ''}">${esc(c.value)}</b>${c.sub ? `<small>${esc(c.sub)}</small>` : ''}</div>`
+  ).join('');
+
+  // Interactive Category Distribution bars
+  const maxCat = Math.max(1, ...cats.map(c => Number(c.value || 0)));
+  $('#categories').innerHTML = cats.length
+    ? cats.map(c => {
+      const val = Number(c.value || 0);
+      const pct = totalAllCats > 0 ? Math.round((val / totalAllCats) * 100) : 0;
+      const isAct = overviewCategory === c.name;
+      return `<div class="bar-row-interactive ${isAct ? 'bar-active' : ''}" data-ov-bar-cat="${esc(c.name)}"><span class="bar-label"><b>${esc(c.name)}</b><b>${val}<span class="bar-pct">${pct}%</span></b></span><span class="bar"><i style="width:${Math.min(100, Math.round((val / maxCat) * 100))}%"></i></span></div>`;
+    }).join('')
+    : '<p class="muted">No data yet.</p>';
+  $('#categories').querySelectorAll('[data-ov-bar-cat]').forEach(el => {
+    el.onclick = () => {
+      const target = el.dataset.ovBarCat || '';
+      overviewCategory = (overviewCategory === target) ? '' : target;
+      overview().catch(() => {});
+    };
+  });
+
+  // Category-scoped Channel Contribution bars with % share
+  const chans = x.channels || [];
+  const totalChan = Math.max(1, Number(m.notifications || chans.reduce((a, b) => a + Number(b.value || 0), 0)));
+  const maxChan = Math.max(1, ...chans.map(c => Number(c.value || 0)));
+  if ($('#overview-channels-title')) {
+    $('#overview-channels-title').textContent = overviewCategory ? `Channel contribution — ${overviewCategory}` : 'Channel contribution';
+  }
+  if ($('#overview-channels-sub')) {
+    $('#overview-channels-sub').textContent = `${chans.length} active channel${chans.length === 1 ? '' : 's'}`;
+  }
+  $('#channels').innerHTML = chans.length
+    ? chans.map(c => {
+      const val = Number(c.value || 0);
+      const share = Math.round((val / totalChan) * 100);
+      return `<div><span class="bar-label"><b>${esc(c.name)}</b><b>${val}<span class="bar-pct">${share}%</span></b></span><span class="bar"><i style="width:${Math.min(100, Math.round((val / maxChan) * 100))}%"></i></span></div>`;
+    }).join('')
+    : `<p class="muted">No channels recorded for ${esc(scopeLabel)} yet.</p>`;
+
+  // Recent parsed signals scoped to category
+  const recent = x.recent_signals || [];
+  if ($('#overview-recent-title')) {
+    $('#overview-recent-title').textContent = overviewCategory ? `Recent parsed signals — ${overviewCategory}` : 'Recent parsed signals';
+  }
+  if ($('#overview-recent-sub')) {
+    $('#overview-recent-sub').textContent = `Showing latest ${recent.length}`;
+  }
+  const recentHost = $('#recent-signals');
+  if (!recent.length) {
+    recentHost.innerHTML = `<p class="muted">No parsed signals for ${esc(scopeLabel)} yet.</p>`;
+  } else {
+    recentHost.innerHTML = `<table><thead><tr><th>ID</th><th>Channel</th><th>Category</th><th>Symbol</th><th>Dir</th><th>Entry</th><th>Status</th><th>Actions</th></tr></thead><tbody>${recent.map(s => {
+      const id = s.id;
+      const entry = s.entry_price != null ? s.entry_price : (s.entry_mode || '—');
+      return `<tr><td>#${esc(id)}</td><td>${esc(s.channel || '—')}</td><td>${esc(s.category || '—')}</td><td><b>${esc(s.symbol || '—')}</b></td><td>${esc(s.direction || '—')}</td><td>${esc(entry)}</td><td>${esc(s.verification_status || '—')}</td><td><button type="button" class="ch-btn" data-ov-goto="${id}">Open</button> <button type="button" class="ch-btn" data-ov-rev="${id}">Review</button></td></tr>`;
+    }).join('')}</tbody></table>`;
+    recentHost.querySelectorAll('[data-ov-goto]').forEach(b => b.onclick = () => openSignalInManagement(+b.dataset.ovGoto));
+    recentHost.querySelectorAll('[data-ov-rev]').forEach(b => b.onclick = () => reviewParse(+b.dataset.ovRev));
+  }
+}
+
+// =========================================================================
+// Telegram-Web-Style Channel Inbox
+// =========================================================================
+const inboxState = {
+  category: '',
+  channelSearch: '',
+  messageSearch: '',
+  channels: [],
+  categories: [],
+  selectedChannel: null, // { channel, category }
+  limit: 200,
+  lastHistory: null,
+  rawMessagesById: new Map(),
+};
+
+const INBOX_AVATAR_COLORS = ['#2563eb', '#0d9488', '#7c3aed', '#db2777', '#d97706', '#059669', '#4f46e5', '#0284c7'];
+
+function channelAvatarColor(name) {
+  let h = 0;
+  const s = String(name || 'CH');
+  for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+  return INBOX_AVATAR_COLORS[Math.abs(h) % INBOX_AVATAR_COLORS.length];
+}
+
+function channelInitials(name) {
+  const words = String(name || 'CH').replace(/[^a-zA-Z0-9\s]/g, ' ').trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return 'CH';
+  if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
+  return (words[0][0] + words[1][0]).toUpperCase();
+}
+
+function fmtInboxDayLabel(iso) {
+  if (!iso) return 'Unknown date';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso).slice(0, 10);
+  const now = new Date();
+  const todayKey = now.toDateString();
+  const yest = new Date(now);
+  yest.setDate(now.getDate() - 1);
+  if (d.toDateString() === todayKey) return 'Today';
+  if (d.toDateString() === yest.toDateString()) return 'Yesterday';
+  return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+}
+
+function fmtInboxClock(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso).slice(11, 16);
+  return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false });
+}
+
+function renderInboxCategoryPills() {
+  const host = $('#inbox-category-pills');
+  if (!host) return;
+  const totalAll = inboxState.categories.reduce((acc, c) => acc + Number(c.value || 0), 0);
+  host.innerHTML = [
+    `<button type="button" class="inbox-cat-pill ${inboxState.category === '' ? 'active' : ''}" data-ib-cat="">All <span>${totalAll}</span></button>`,
+    ...inboxState.categories.map(c =>
+      `<button type="button" class="inbox-cat-pill ${inboxState.category === c.name ? 'active' : ''}" data-ib-cat="${esc(c.name)}">${esc(c.name)} <span>${Number(c.value || 0)}</span></button>`
+    )
+  ].join('');
+  host.querySelectorAll('[data-ib-cat]').forEach(btn => {
+    btn.onclick = () => {
+      inboxState.category = btn.dataset.ibCat || '';
+      loadInboxChannels(true).catch(() => {});
+    };
+  });
+}
+
+function renderInboxChannelList() {
+  const host = $('#inbox-channel-list');
+  if (!host) return;
+  const q = inboxState.channelSearch.trim().toLowerCase();
+  const list = q
+    ? inboxState.channels.filter(c => c.channel.toLowerCase().includes(q) || c.category.toLowerCase().includes(q))
+    : inboxState.channels;
+
+  if ($('#inbox-channel-count')) {
+    $('#inbox-channel-count').textContent = `${list.length} chat${list.length === 1 ? '' : 's'}`;
+  }
+
+  if (!list.length) {
+    host.innerHTML = '<p class="muted" style="padding:16px;font-size:12px">No channels match this category or search.</p>';
+    return;
+  }
+
+  host.innerHTML = list.map((c, idx) => {
+    const isSel = inboxState.selectedChannel &&
+      inboxState.selectedChannel.channel === c.channel &&
+      inboxState.selectedChannel.category === c.category;
+    const preview = String(c.last_message || '').replace(/\s+/g, ' ').trim().slice(0, 72) || '(empty message)';
+    return `<button type="button" class="inbox-ch-row ${isSel ? 'active' : ''}" data-ib-ch-idx="${idx}">
+      <div class="inbox-avatar" style="background:${channelAvatarColor(c.channel)}">${esc(channelInitials(c.channel))}</div>
+      <div class="inbox-ch-meta">
+        <div class="inbox-ch-top">
+          <span class="inbox-ch-name">${esc(c.channel)}</span>
+          <span class="inbox-ch-time">${esc(fmtShortTime(c.last_time))}</span>
+        </div>
+        <div class="inbox-ch-preview">${esc(preview)}</div>
+        <div class="inbox-ch-badges">
+          <span class="inbox-mini-tag">${esc(c.category)}</span>
+          <span class="inbox-cnt-pill">${Number(c.total_messages || 0)} msgs</span>
+          ${c.needs_review_count > 0 ? `<span class="inbox-rev-pill">${c.needs_review_count} review</span>` : ''}
+        </div>
+      </div>
+    </button>`;
+  }).join('');
+
+  host.querySelectorAll('[data-ib-ch-idx]').forEach(btn => {
+    btn.onclick = () => {
+      const ch = list[+btn.dataset.ibChIdx];
+      if (!ch) return;
+      inboxState.selectedChannel = { channel: ch.channel, category: ch.category };
+      inboxState.limit = 200;
+      inboxState.messageSearch = '';
+      renderInboxChannelList();
+      $('#inbox-shell')?.classList.add('mobile-chat-open');
+      loadInboxMessages(true).catch(() => {});
+    };
+  });
+}
+
+async function loadInboxChannels(preserveSelection = true) {
+  const qs = inboxState.category ? '?category=' + encodeURIComponent(inboxState.category) : '';
+  const data = await api('/api/v1/inbox/channels' + qs);
+  inboxState.categories = data.categories || [];
+  inboxState.channels = data.channels || [];
+  renderInboxCategoryPills();
+
+  if (preserveSelection && inboxState.selectedChannel) {
+    const stillExists = inboxState.channels.some(c =>
+      c.channel === inboxState.selectedChannel.channel && c.category === inboxState.selectedChannel.category
+    );
+    if (!stillExists) inboxState.selectedChannel = null;
+  }
+  if (!inboxState.selectedChannel && inboxState.channels.length && window.innerWidth > 760) {
+    const first = inboxState.channels[0];
+    inboxState.selectedChannel = { channel: first.channel, category: first.category };
+    renderInboxChannelList();
+    await loadInboxMessages(true);
+    return;
+  }
+  renderInboxChannelList();
+  if (!inboxState.selectedChannel) {
+    if ($('#inbox-chat-header')) {
+      $('#inbox-chat-header').innerHTML = '<div class="inbox-chat-empty-head"><span class="muted">Select a channel to open message history</span></div>';
+    }
+    if ($('#inbox-messages')) {
+      $('#inbox-messages').innerHTML = '<div class="inbox-empty-state"><div class="inbox-empty-icon">&#128172;</div><h3>Telegram-Style Channel Inbox</h3><p class="muted">Pick any category and channel on the left to inspect every received signal, copy raw text in one click, and cross-check the Parsed Summary box.</p></div>';
+    }
+  }
+}
+
+async function loadInboxMessages(scrollToBottom = false) {
+  const sel = inboxState.selectedChannel;
+  const headHost = $('#inbox-chat-header');
+  const msgHost = $('#inbox-messages');
+  if (!sel || !headHost || !msgHost) return;
+
+  const q = new URLSearchParams({
+    channel: sel.channel,
+    category: sel.category || '',
+    limit: String(inboxState.limit)
+  });
+  if (inboxState.messageSearch.trim()) q.set('search', inboxState.messageSearch.trim());
+
+  const data = await api('/api/v1/inbox/messages?' + q);
+  inboxState.lastHistory = data;
+  const msgs = data.messages || [];
+  inboxState.rawMessagesById.clear();
+  msgs.forEach(m => inboxState.rawMessagesById.set(String(m.id), m.message || ''));
+
+  headHost.innerHTML = `
+    <div class="inbox-chat-head-left">
+      <button type="button" id="inbox-mobile-back" class="ch-btn inbox-back-btn">&larr; Chats</button>
+      <div class="inbox-avatar" style="background:${channelAvatarColor(sel.channel)};width:36px;height:36px;font-size:12px">${esc(channelInitials(sel.channel))}</div>
+      <div class="inbox-chat-head-title">
+        <h3>${esc(data.channel)}</h3>
+        <div class="inbox-chat-stats">
+          <span class="inbox-mini-tag">${esc(data.category || sel.category)}</span>
+          <span>Total: <b>${Number(data.total_count || 0)}</b></span>
+          <span>Parsed: <b class="green">${Number(data.parsed_count || 0)}</b></span>
+          ${data.needs_review_count > 0 ? `<span>Review: <b class="amber">${data.needs_review_count}</b></span>` : ''}
+        </div>
+      </div>
+    </div>
+    <div class="inbox-chat-head-right">
+      <input id="inbox-msg-search" class="inbox-chat-search" type="search" placeholder="Search in chat..." value="${esc(inboxState.messageSearch)}">
+      <button type="button" id="inbox-chat-refresh" class="ch-btn">Refresh</button>
+    </div>
+  `;
+
+  $('#inbox-mobile-back')?.addEventListener('click', () => {
+    $('#inbox-shell')?.classList.remove('mobile-chat-open');
+  });
+  $('#inbox-chat-refresh')?.addEventListener('click', () => loadInboxMessages(false).catch(() => {}));
+  let searchTimer = null;
+  $('#inbox-msg-search')?.addEventListener('input', ev => {
+    inboxState.messageSearch = ev.target.value;
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => loadInboxMessages(false).catch(() => {}), 260);
+  });
+
+  if (!msgs.length) {
+    msgHost.innerHTML = `<div class="inbox-empty-state"><p class="muted">${inboxState.messageSearch ? 'No messages match your search in this channel.' : 'No messages recorded for this channel yet.'}</p></div>`;
+    return;
+  }
+
+  let html = '';
+  if (data.has_more && inboxState.limit < 1000) {
+    html += `<div class="inbox-load-more-wrap"><button type="button" id="inbox-load-more" class="ch-btn">Load older messages (showing latest ${msgs.length} of ${data.total_count})</button></div>`;
+  }
+
+  let lastDay = '';
+  for (const m of msgs) {
+    const ts = m.notification_time || m.received_at;
+    const dayLbl = fmtInboxDayLabel(ts);
+    if (dayLbl !== lastDay) {
+      html += `<div class="inbox-date-divider">${esc(dayLbl)}</div>`;
+      lastDay = dayLbl;
+    }
+
+    const pStatus = m.parsing_status || 'unparsed';
+    const isReview = pStatus === 'needs_review' || m.manual_review_status === 'required';
+    const isParsed = pStatus === 'parsed' || pStatus === 'manually_corrected';
+    const boxCls = isReview ? 'st-review' : (isParsed ? 'st-parsed' : 'st-unparsed');
+    const summary = formatParsedSummaryLine(m);
+    const vStatus = m.verification_status || '';
+    const vCls = vStatus === 'target_hit' ? 'v-tp' : (vStatus === 'stop_loss_hit' ? 'v-sl' : (vStatus === 'pending' ? 'v-pend' : ''));
+    const dupTag = m.is_duplicate ? '<span class="inbox-mini-tag">Duplicate</span>' : (String(m.duplicate_reason || '').startsWith('signal_update:') ? '<span class="inbox-mini-tag">Update</span>' : '');
+
+    html += `
+      <div class="tg-bubble">
+        <div class="tg-bubble-head">
+          <div class="tg-bubble-meta">
+            <span>#${esc(m.id)}</span>
+            <span>${esc(fmtInboxClock(ts))}</span>
+            ${dupTag}
+          </div>
+          <button type="button" class="tg-copy-btn" data-copy-raw="${esc(m.id)}">Copy</button>
+        </div>
+        <pre class="tg-raw-text">${esc(m.message || '')}</pre>
+        <div class="tg-parsed-box ${boxCls}">
+          <div class="tg-parsed-head">
+            <div class="tg-parsed-tags">
+              <span class="tg-parsed-lbl">Parsed Summary</span>
+              <span class="parse-pill ${isParsed ? 'p-ok' : 'p-warn'}">${esc(pStatus)}</span>
+              ${vStatus ? `<span class="tg-ver-pill ${vCls}">${esc(vStatus)}</span>` : ''}
+            </div>
+            <div class="tg-parsed-actions">
+              ${m.signal_id ? `<button type="button" class="ch-btn" data-ib-review="${m.signal_id}">Quick Review</button><button type="button" class="ch-btn" data-ib-sig="${m.signal_id}">#${m.signal_id}</button>` : ''}
+            </div>
+          </div>
+          <div class="tg-parsed-summary">${esc(summary)}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  msgHost.innerHTML = html;
+
+  $('#inbox-load-more')?.addEventListener('click', () => {
+    inboxState.limit = Math.min(1000, inboxState.limit + 300);
+    loadInboxMessages(false).catch(() => {});
+  });
+
+  msgHost.querySelectorAll('[data-copy-raw]').forEach(btn => {
+    btn.onclick = async () => {
+      const raw = inboxState.rawMessagesById.get(String(btn.dataset.copyRaw)) || '';
+      const ok = await copyTextWithFallback(raw);
+      btn.textContent = ok ? 'Copied ✓' : 'Copy failed';
+      if (ok) btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = 'Copy';
+        btn.classList.remove('copied');
+      }, 1500);
+    };
+  });
+
+  msgHost.querySelectorAll('[data-ib-review]').forEach(btn => {
+    btn.onclick = () => reviewParse(+btn.dataset.ibReview);
+  });
+  msgHost.querySelectorAll('[data-ib-sig]').forEach(btn => {
+    btn.onclick = () => openSignalInManagement(+btn.dataset.ibSig);
+  });
+
+  if (scrollToBottom) {
+    msgHost.scrollTop = msgHost.scrollHeight;
+  }
+}
+
+async function loadInboxView() {
+  await loadInboxChannels(true);
+  if (inboxState.selectedChannel) {
+    await loadInboxMessages(true);
+  }
+}
+
+async function refreshInboxView() {
+  await loadInboxChannels(true);
+  if (inboxState.selectedChannel) {
+    await loadInboxMessages(false);
+  }
+}
+
+$('#inbox-channel-search')?.addEventListener('input', ev => {
+  inboxState.channelSearch = ev.target.value;
+  renderInboxChannelList();
+});
+$('#inbox-refresh-btn')?.addEventListener('click', () => refreshInboxView().catch(() => {}));
 
 function renderActiveFilterChips() {
   const chips = [];
@@ -1670,7 +2109,7 @@ function show(view) {
   if (!authSessionToken) return;
   loadApiHealth().catch(() => {});
   ({
-    overview, notifications: notificationLog, integrations, signals: loadSignals,
+    overview, inbox: loadInboxView, notifications: notificationLog, integrations, signals: loadSignals,
     market: async () => { await loadApiHealth(); await coverage(); updateProviderUI(); },
     analytics: loadAnalytics, logs: loadLogs,
     settings: async () => {

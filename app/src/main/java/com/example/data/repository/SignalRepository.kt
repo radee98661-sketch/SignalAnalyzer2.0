@@ -88,6 +88,8 @@ data class OverviewData(
     val notifications: Int,
     val parsed: Int,
     val today: Int,
+    val todayParsed: Int = 0,
+    val selectedCategory: String = "",
     val targetHits: Int,
     val stopLossHits: Int,
     val pending: Int,
@@ -101,6 +103,28 @@ data class OverviewData(
     val recentSignals: List<EnrichedSignal>,
     val latestSync: SynchronizationLogEntity?,
     val integrations: List<IntegrationEntity>
+)
+
+data class InboxChannelItem(
+    val channel: String,
+    val category: String,
+    val totalMessages: Int,
+    val todayMessages: Int,
+    val parsedCount: Int,
+    val needsReviewCount: Int,
+    val lastMessage: String,
+    val lastTime: String,
+    val lastRawId: Long
+)
+
+data class InboxChannelHistory(
+    val channel: String,
+    val category: String,
+    val totalCount: Int,
+    val parsedCount: Int,
+    val needsReviewCount: Int,
+    val hasMore: Boolean,
+    val messages: List<NotificationJoinedRow>
 )
 
 data class SignalChartData(
@@ -224,18 +248,10 @@ class SignalRepository(
         return candidates.size to updated
     }
 
-    suspend fun getOverview(): OverviewData {
+    suspend fun getOverview(category: String = ""): OverviewData {
         val core = db.coreDao()
-        val total = core.countPrimaryNotifications()
-        val parsed = core.countParsedSignals()
-        val verified = core.countVerifiedSignals()
-        val targets = core.countTargetHits()
-        val stops = core.countStopLossHits()
-        val pending = core.countPendingSignals()
-        val entered = core.countEnteredSignals()
-        val today = core.countTodayNotifications(LocalDate.now().toString())
-        val pnlInr = core.sumPnlByCurrency("INR")
-        val pnlUsd = core.sumPnlByCurrency("USD")
+        val todayDate = LocalDate.now().toString()
+        val selectedCat = if (category.isBlank()) "" else canonicalCategory(category)
 
         val catMap = linkedMapOf<String, Int>()
         for (name in CATEGORY_ALIASES.keys) catMap[name] = 0
@@ -251,10 +267,176 @@ class SignalRepository(
         val extendedIntervalMins = settings["verification_extended_interval_minutes"]?.toIntOrNull() ?: 60
         val rules = DefaultRulesEngine.rulesFromJson(settings["default_sl_rules"])
 
+        if (selectedCat.isBlank()) {
+            val total = core.countPrimaryNotifications()
+            val parsed = core.countParsedSignals()
+            val verified = core.countVerifiedSignals()
+            val targets = core.countTargetHits()
+            val stops = core.countStopLossHits()
+            val pending = core.countPendingSignals()
+            val entered = core.countEnteredSignals()
+            val today = core.countTodayNotifications(todayDate)
+            val todayParsed = core.queryInt(
+                SimpleSQLiteQuery(
+                    "SELECT COUNT(*) FROM signals s JOIN raw_notifications r ON r.id = s.raw_notification_id " +
+                        "WHERE r.is_duplicate = 0 AND s.parsing_status = 'parsed' " +
+                        "AND substr(COALESCE(r.notification_time, r.received_at), 1, 10) = ?",
+                    arrayOf(todayDate)
+                )
+            )
+            val pnlInr = core.sumPnlByCurrency("INR")
+            val pnlUsd = core.sumPnlByCurrency("USD")
+
+            return OverviewData(
+                notifications = total,
+                parsed = parsed,
+                today = today,
+                todayParsed = todayParsed,
+                selectedCategory = "",
+                targetHits = targets,
+                stopLossHits = stops,
+                pending = pending,
+                entryRate = DefaultRulesEngine.roundValue(100.0 * entered / maxOf(parsed, 1), 1),
+                winRate = DefaultRulesEngine.roundValue(100.0 * targets / maxOf(verified, 1), 1),
+                pnlInr = pnlInr,
+                pnlUsd = pnlUsd,
+                categories = catMap.entries.map { it.key to it.value },
+                channels = core.getChannelDistribution().map { (it.name ?: "Unknown") to it.value },
+                recentNotifications = core.getRecentRawNotifications(),
+                recentSignals = core.getRecentSignalsJoined().map {
+                    enrichSignal(it, initWait, repeatMins, fastPhaseMins, extendedIntervalMins, rules)
+                },
+                latestSync = core.getLatestSyncLog(),
+                integrations = core.getAllIntegrations()
+            )
+        }
+
+        val aliases = categoryAliasesFor(selectedCat)
+        val placeholders = aliases.joinToString(",") { "?" }
+        val aliasArgs = aliases.toTypedArray<Any>()
+
+        val total = core.queryInt(
+            SimpleSQLiteQuery(
+                "SELECT COUNT(*) FROM raw_notifications r WHERE r.is_duplicate = 0 AND LOWER(COALESCE(r.category,'')) IN ($placeholders)",
+                aliasArgs
+            )
+        )
+        val parsed = core.queryInt(
+            SimpleSQLiteQuery(
+                "SELECT COUNT(*) FROM signals s JOIN raw_notifications r ON r.id = s.raw_notification_id " +
+                    "WHERE r.is_duplicate = 0 AND s.parsing_status = 'parsed' AND LOWER(COALESCE(r.category,'')) IN ($placeholders)",
+                aliasArgs
+            )
+        )
+        val verified = core.queryInt(
+            SimpleSQLiteQuery(
+                "SELECT COUNT(*) FROM signals s JOIN raw_notifications r ON r.id = s.raw_notification_id " +
+                    "WHERE r.is_duplicate = 0 AND s.verification_status IN ('target_hit','stop_loss_hit') AND LOWER(COALESCE(r.category,'')) IN ($placeholders)",
+                aliasArgs
+            )
+        )
+        val targets = core.queryInt(
+            SimpleSQLiteQuery(
+                "SELECT COUNT(*) FROM signals s JOIN raw_notifications r ON r.id = s.raw_notification_id " +
+                    "WHERE r.is_duplicate = 0 AND s.verification_status = 'target_hit' AND LOWER(COALESCE(r.category,'')) IN ($placeholders)",
+                aliasArgs
+            )
+        )
+        val stops = core.queryInt(
+            SimpleSQLiteQuery(
+                "SELECT COUNT(*) FROM signals s JOIN raw_notifications r ON r.id = s.raw_notification_id " +
+                    "WHERE r.is_duplicate = 0 AND s.verification_status = 'stop_loss_hit' AND LOWER(COALESCE(r.category,'')) IN ($placeholders)",
+                aliasArgs
+            )
+        )
+        val pending = core.queryInt(
+            SimpleSQLiteQuery(
+                "SELECT COUNT(*) FROM signals s JOIN raw_notifications r ON r.id = s.raw_notification_id " +
+                    "WHERE r.is_duplicate = 0 AND s.verification_status = 'pending' AND LOWER(COALESCE(r.category,'')) IN ($placeholders)",
+                aliasArgs
+            )
+        )
+        val entered = core.queryInt(
+            SimpleSQLiteQuery(
+                "SELECT COUNT(*) FROM signals s JOIN raw_notifications r ON r.id = s.raw_notification_id " +
+                    "WHERE r.is_duplicate = 0 AND s.verification_status IN ('entry_hit','target_hit','stop_loss_hit','ambiguous') " +
+                    "AND LOWER(COALESCE(r.category,'')) IN ($placeholders)",
+                aliasArgs
+            )
+        )
+        val today = core.queryInt(
+            SimpleSQLiteQuery(
+                "SELECT COUNT(*) FROM raw_notifications r WHERE r.is_duplicate = 0 " +
+                    "AND substr(COALESCE(r.notification_time, r.received_at), 1, 10) = ? " +
+                    "AND LOWER(COALESCE(r.category,'')) IN ($placeholders)",
+                arrayOf<Any>(todayDate, *aliasArgs)
+            )
+        )
+        val todayParsed = core.queryInt(
+            SimpleSQLiteQuery(
+                "SELECT COUNT(*) FROM signals s JOIN raw_notifications r ON r.id = s.raw_notification_id " +
+                    "WHERE r.is_duplicate = 0 AND s.parsing_status = 'parsed' " +
+                    "AND substr(COALESCE(r.notification_time, r.received_at), 1, 10) = ? " +
+                    "AND LOWER(COALESCE(r.category,'')) IN ($placeholders)",
+                arrayOf<Any>(todayDate, *aliasArgs)
+            )
+        )
+        val pnlInr = core.queryDouble(
+            SimpleSQLiteQuery(
+                "SELECT ROUND(COALESCE(SUM(tr.pnl_amount), 0), 2) FROM trade_results tr " +
+                    "JOIN signals s ON s.id = tr.signal_id JOIN raw_notifications r ON r.id = s.raw_notification_id " +
+                    "WHERE r.is_duplicate = 0 AND tr.pnl_currency = 'INR' AND LOWER(COALESCE(r.category,'')) IN ($placeholders)",
+                aliasArgs
+            )
+        )
+        val pnlUsd = core.queryDouble(
+            SimpleSQLiteQuery(
+                "SELECT ROUND(COALESCE(SUM(tr.pnl_amount), 0), 2) FROM trade_results tr " +
+                    "JOIN signals s ON s.id = tr.signal_id JOIN raw_notifications r ON r.id = s.raw_notification_id " +
+                    "WHERE r.is_duplicate = 0 AND tr.pnl_currency = 'USD' AND LOWER(COALESCE(r.category,'')) IN ($placeholders)",
+                aliasArgs
+            )
+        )
+        val channels = core.queryNamedCounts(
+            SimpleSQLiteQuery(
+                "SELECT COALESCE(NULLIF(TRIM(r.channel),''), 'Unknown') AS name, COUNT(*) AS value " +
+                    "FROM raw_notifications r WHERE r.is_duplicate = 0 AND LOWER(COALESCE(r.category,'')) IN ($placeholders) " +
+                    "GROUP BY COALESCE(NULLIF(TRIM(r.channel),''), 'Unknown') ORDER BY value DESC LIMIT 12",
+                aliasArgs
+            )
+        ).map { (it.name ?: "Unknown") to it.value }
+
+        val recentRaw = core.queryRawNotifications(
+            SimpleSQLiteQuery(
+                "SELECT * FROM raw_notifications r WHERE LOWER(COALESCE(r.category,'')) IN ($placeholders) ORDER BY r.id DESC LIMIT 8",
+                aliasArgs
+            )
+        )
+        val recentSignals = core.querySignalsJoined(
+            SimpleSQLiteQuery(
+                "SELECT s.*, r.received_at, r.notification_time, r.source_app, r.channel, r.category, r.title, r.message, " +
+                    "r.notification_id, r.is_duplicate, r.duplicate_of, r.duplicate_reason, r.duplicate_group_id, " +
+                    "vs.first_scheduled_at, vs.next_scheduled_at, vs.last_verified_at, vs.last_result, " +
+                    "vs.status AS scheduler_status, vs.timeframe AS verification_timeframe, " +
+                    "tr.entry_hit_at, tr.target_hit_at, tr.stop_loss_hit_at, tr.events_json, tr.detail AS trade_detail, " +
+                    "tr.pnl_amount, tr.pnl_currency, tr.trades_count, tr.legs_json, " +
+                    "tr.max_tp_hit, tr.all_targets_hit, tr.closed_by_sl_after_tp, " +
+                    "tr.tp1_pnl_amount, tr.tp2_pnl_amount, tr.tp3_pnl_amount, tr.highest_tp_pnl_amount, tr.sl_pnl_amount, tr.tp_levels_json " +
+                    "FROM signals s JOIN raw_notifications r ON r.id = s.raw_notification_id " +
+                    "LEFT JOIN verification_schedules vs ON vs.signal_id = s.id " +
+                    "LEFT JOIN trade_results tr ON tr.signal_id = s.id " +
+                    "WHERE r.is_duplicate = 0 AND LOWER(COALESCE(r.category,'')) IN ($placeholders) " +
+                    "ORDER BY s.id DESC LIMIT 12",
+                aliasArgs
+            )
+        ).map { enrichSignal(it, initWait, repeatMins, fastPhaseMins, extendedIntervalMins, rules) }
+
         return OverviewData(
             notifications = total,
             parsed = parsed,
             today = today,
+            todayParsed = todayParsed,
+            selectedCategory = selectedCat,
             targetHits = targets,
             stopLossHits = stops,
             pending = pending,
@@ -263,11 +445,9 @@ class SignalRepository(
             pnlInr = pnlInr,
             pnlUsd = pnlUsd,
             categories = catMap.entries.map { it.key to it.value },
-            channels = core.getChannelDistribution().map { (it.name ?: "Unknown") to it.value },
-            recentNotifications = core.getRecentRawNotifications(),
-            recentSignals = core.getRecentSignalsJoined().map {
-                enrichSignal(it, initWait, repeatMins, fastPhaseMins, extendedIntervalMins, rules)
-            },
+            channels = channels,
+            recentNotifications = recentRaw,
+            recentSignals = recentSignals,
             latestSync = core.getLatestSyncLog(),
             integrations = core.getAllIntegrations()
         )
@@ -991,6 +1171,146 @@ class SignalRepository(
         }
         args += clampedLimit
         return db.coreDao().queryNotificationsJoined(SimpleSQLiteQuery(sql, args.toTypedArray()))
+    }
+
+    suspend fun getInboxChannels(category: String = ""): List<InboxChannelItem> {
+        val core = db.coreDao()
+        val todayDate = LocalDate.now().toString()
+        val where = mutableListOf<String>()
+        val args = mutableListOf<Any>(todayDate)
+
+        if (category.isNotBlank()) {
+            val aliases = categoryAliasesFor(category)
+            where += "LOWER(COALESCE(r.category,'')) IN (${aliases.joinToString(",") { "?" }})"
+            args.addAll(aliases)
+        }
+
+        val sql = buildString {
+            append(
+                "SELECT COALESCE(NULLIF(TRIM(r.channel),''), 'Unknown') AS channel, " +
+                    "COALESCE(NULLIF(TRIM(r.category),''), 'Uncategorized') AS category, " +
+                    "COUNT(DISTINCT r.id) AS total_messages, " +
+                    "COUNT(DISTINCT CASE WHEN substr(COALESCE(r.notification_time, r.received_at), 1, 10) = ? THEN r.id END) AS today_messages, " +
+                    "COUNT(DISTINCT CASE WHEN s.parsing_status IN ('parsed','manually_corrected') THEN r.id END) AS parsed_count, " +
+                    "COUNT(DISTINCT CASE WHEN s.parsing_status = 'needs_review' OR s.manual_review_status = 'required' THEN r.id END) AS needs_review_count, " +
+                    "(SELECT r2.message FROM raw_notifications r2 WHERE r2.id = MAX(r.id)) AS last_message, " +
+                    "MAX(COALESCE(r.notification_time, r.received_at)) AS last_time, " +
+                    "MAX(r.id) AS last_raw_id " +
+                    "FROM raw_notifications r LEFT JOIN signals s ON s.raw_notification_id = r.id"
+            )
+            if (where.isNotEmpty()) append(" WHERE ").append(where.joinToString(" AND "))
+            append(" GROUP BY COALESCE(NULLIF(TRIM(r.channel),''), 'Unknown'), COALESCE(NULLIF(TRIM(r.category),''), 'Uncategorized') ")
+            append(" ORDER BY last_time DESC, last_raw_id DESC")
+        }
+
+        val rawRows = core.queryInboxChannelSummaries(SimpleSQLiteQuery(sql, args.toTypedArray()))
+        // Merge any legacy category alias rows for the same (channel, canonicalCategory) pair
+        val merged = linkedMapOf<Pair<String, String>, InboxChannelItem>()
+        for (row in rawRows) {
+            val ch = row.channel?.trim()?.ifEmpty { "Unknown" } ?: "Unknown"
+            val canonCat = canonicalCategory(row.category.orEmpty())
+            val key = ch to canonCat
+            val prev = merged[key]
+            if (prev == null) {
+                merged[key] = InboxChannelItem(
+                    channel = ch,
+                    category = canonCat,
+                    totalMessages = row.totalMessages,
+                    todayMessages = row.todayMessages,
+                    parsedCount = row.parsedCount,
+                    needsReviewCount = row.needsReviewCount,
+                    lastMessage = row.lastMessage.orEmpty(),
+                    lastTime = row.lastTime.orEmpty(),
+                    lastRawId = row.lastRawId
+                )
+            } else {
+                val useNew = row.lastRawId > prev.lastRawId
+                merged[key] = prev.copy(
+                    totalMessages = prev.totalMessages + row.totalMessages,
+                    todayMessages = prev.todayMessages + row.todayMessages,
+                    parsedCount = prev.parsedCount + row.parsedCount,
+                    needsReviewCount = prev.needsReviewCount + row.needsReviewCount,
+                    lastMessage = if (useNew) row.lastMessage.orEmpty() else prev.lastMessage,
+                    lastTime = if (useNew) row.lastTime.orEmpty() else prev.lastTime,
+                    lastRawId = maxOf(prev.lastRawId, row.lastRawId)
+                )
+            }
+        }
+        return merged.values.sortedWith(compareByDescending<InboxChannelItem> { it.lastTime }.thenByDescending { it.lastRawId })
+    }
+
+    suspend fun getInboxMessages(
+        channel: String,
+        category: String = "",
+        search: String = "",
+        limit: Int = 200
+    ): InboxChannelHistory {
+        val core = db.coreDao()
+        val clampedLimit = limit.coerceIn(20, 1000)
+        val cleanChannel = channel.trim().ifEmpty { "Unknown" }
+        val baseWhere = mutableListOf<String>("COALESCE(NULLIF(TRIM(r.channel),''), 'Unknown') = ?")
+        val baseArgs = mutableListOf<Any>(cleanChannel)
+
+        val canonCat = if (category.isNotBlank()) canonicalCategory(category) else ""
+        if (canonCat.isNotBlank()) {
+            val aliases = categoryAliasesFor(canonCat)
+            baseWhere += "LOWER(COALESCE(r.category,'')) IN (${aliases.joinToString(",") { "?" }})"
+            baseArgs.addAll(aliases)
+        }
+
+        val whereClause = baseWhere.joinToString(" AND ")
+        val totalCount = core.queryInt(
+            SimpleSQLiteQuery("SELECT COUNT(*) FROM raw_notifications r WHERE $whereClause", baseArgs.toTypedArray())
+        )
+        val parsedCount = core.queryInt(
+            SimpleSQLiteQuery(
+                "SELECT COUNT(DISTINCT r.id) FROM raw_notifications r JOIN signals s ON s.raw_notification_id = r.id " +
+                    "WHERE $whereClause AND s.parsing_status IN ('parsed','manually_corrected')",
+                baseArgs.toTypedArray()
+            )
+        )
+        val needsReviewCount = core.queryInt(
+            SimpleSQLiteQuery(
+                "SELECT COUNT(DISTINCT r.id) FROM raw_notifications r JOIN signals s ON s.raw_notification_id = r.id " +
+                    "WHERE $whereClause AND (s.parsing_status = 'needs_review' OR s.manual_review_status = 'required')",
+                baseArgs.toTypedArray()
+            )
+        )
+
+        val msgWhere = baseWhere.toMutableList()
+        val msgArgs = baseArgs.toMutableList()
+        val q = search.trim()
+        if (q.isNotEmpty()) {
+            msgWhere += "(LOWER(COALESCE(r.message,'')) LIKE ? OR LOWER(COALESCE(s.symbol,'')) LIKE ?)"
+            val pat = "%${q.lowercase(Locale.US)}%"
+            msgArgs += pat
+            msgArgs += pat
+        }
+
+        val msgSql = buildString {
+            append(
+                "SELECT r.*, s.id AS signal_id, s.symbol, s.direction, s.entry_price, s.additional_entries, " +
+                    "s.stop_loss, s.targets, s.option_type, s.strike_price, s.expiry_date, s.entry_mode, " +
+                    "s.parsing_status, s.manual_review_status, s.parsing_confidence, s.parsing_explanation, s.verification_status " +
+                    "FROM raw_notifications r LEFT JOIN signals s ON s.raw_notification_id = r.id " +
+                    "WHERE ${msgWhere.joinToString(" AND ")} " +
+                    "ORDER BY COALESCE(r.notification_time, r.received_at) DESC, r.id DESC LIMIT ?"
+            )
+        }
+        msgArgs += (clampedLimit + 1)
+        val fetchedDesc = core.queryNotificationsJoined(SimpleSQLiteQuery(msgSql, msgArgs.toTypedArray()))
+        val hasMore = fetchedDesc.size > clampedLimit
+        val trimmedChrono = fetchedDesc.take(clampedLimit).reversed()
+
+        return InboxChannelHistory(
+            channel = cleanChannel,
+            category = canonCat.ifBlank { trimmedChrono.lastOrNull()?.category?.let { canonicalCategory(it) }.orEmpty() },
+            totalCount = totalCount,
+            parsedCount = parsedCount,
+            needsReviewCount = needsReviewCount,
+            hasMore = hasMore,
+            messages = trimmedChrono
+        )
     }
 
     suspend fun saveIntegration(provider: String, configJson: String, secrets: Map<String, String>) {

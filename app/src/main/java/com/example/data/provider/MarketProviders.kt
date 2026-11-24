@@ -154,9 +154,15 @@ class OkHttpMarketDataProviders(
     private val angelMasterUrl: String = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
 ) : MarketDataProviders {
 
-    private var cachedAngelJwt: String? = null
-    private var cachedAngelClientId: String? = null
-    private var cachedAngelExpiresAtMs: Long = 0L
+    private data class CachedAngelSession(
+        val jwt: String,
+        val expiresAtMs: Long
+    )
+
+    private val angelSessions = java.util.concurrent.ConcurrentHashMap<String, CachedAngelSession>()
+
+    private fun angelCacheKey(apiKey: String, clientId: String): String =
+        "${apiKey.trim().hashCode()}:${clientId.trim().uppercase(Locale.US)}"
 
     private val tdDateFmt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(ZoneOffset.UTC)
 
@@ -404,10 +410,12 @@ class OkHttpMarketDataProviders(
             throw ProviderError("Angel One API key, Client ID, password/PIN, and TOTP secret are required.", null, "auth_error")
         }
 
+        val cacheKey = angelCacheKey(apiKey, clientId)
         val nowMs = System.currentTimeMillis()
-        synchronized(this@OkHttpMarketDataProviders) {
-            if (!forceRefresh && cachedAngelJwt != null && cachedAngelClientId == clientId && nowMs < cachedAngelExpiresAtMs) {
-                return@withContext cachedAngelJwt!! to TimeUtils.utcNowIso()
+        if (!forceRefresh) {
+            val existing = angelSessions[cacheKey]
+            if (existing != null && nowMs < existing.expiresAtMs) {
+                return@withContext existing.jwt to TimeUtils.utcNowIso()
             }
         }
 
@@ -446,11 +454,10 @@ class OkHttpMarketDataProviders(
             throw ProviderError(msg, 401, ProviderErrorClassifier.classify(401, msg))
         }
 
-        synchronized(this@OkHttpMarketDataProviders) {
-            cachedAngelJwt = jwt
-            cachedAngelClientId = clientId
-            cachedAngelExpiresAtMs = System.currentTimeMillis() + (4L * 3600L * 1000L)
-        }
+        angelSessions[cacheKey] = CachedAngelSession(
+            jwt = jwt,
+            expiresAtMs = System.currentTimeMillis() + (4L * 3600L * 1000L)
+        )
         jwt to TimeUtils.utcNowIso()
     }
 

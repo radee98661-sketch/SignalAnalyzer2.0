@@ -716,9 +716,17 @@ class SignalRepository(
             val latestIsRecentError = latest != null && latest.status != "success" &&
                 (lastErrorDt == null || !lastErrorDt.isBefore(alertCutoff))
 
+            val pSecrets = if (id in setOf("twelve_data", "angel_one")) secretStore.getProviderSecrets(id) else emptyMap()
+            val failoverStatus = verificationService.failover.getFailoverStatus(id, pSecrets)
+
             var status = when {
-                latestIsRecentError && lastError?.errorCategory in setOf("rate_limited", "quota_exceeded") -> "rate_limited"
-                latestIsRecentError && lastError?.errorCategory == "auth_error" -> "error"
+                failoverStatus.activeSlot == "exhausted" -> "rate_limited"
+                latestIsRecentError && lastError?.errorCategory in setOf("rate_limited", "quota_exceeded") -> {
+                    if (failoverStatus.activeSlot == ProviderFailoverManager.SLOT_BACKUP) "degraded" else "rate_limited"
+                }
+                latestIsRecentError && lastError?.errorCategory == "auth_error" -> {
+                    if (failoverStatus.activeSlot == ProviderFailoverManager.SLOT_BACKUP) "degraded" else "error"
+                }
                 latestIsRecentError -> "degraded"
                 calls24h == 0 && id != "binance" && integrations[id] == null -> "unconfigured"
                 else -> "healthy"
@@ -758,7 +766,9 @@ class SignalRepository(
             if (latestIsRecentError && lastError != null) {
                 val alreadyHasTwelveQuota = id == "twelve_data" && alerts.any { it.provider == id }
                 if (!alreadyHasTwelveQuota) {
-                    val sev = if (lastError.errorCategory in setOf("rate_limited", "quota_exceeded", "auth_error")) "error" else "warning"
+                    val sev = if (lastError.errorCategory in setOf("rate_limited", "quota_exceeded", "auth_error") &&
+                        failoverStatus.activeSlot != ProviderFailoverManager.SLOT_BACKUP
+                    ) "error" else "warning"
                     alerts += ApiHealthAlert(
                         provider = id,
                         severity = sev,
@@ -781,7 +791,10 @@ class SignalRepository(
                 lastErrorAt = lastError?.requestedAt,
                 lastErrorCategory = lastError?.errorCategory,
                 lastHttpCode = lastError?.httpCode,
-                lastErrorMessage = lastError?.error
+                lastErrorMessage = lastError?.error,
+                backupConfigured = failoverStatus.backupConfigured,
+                activeSlot = failoverStatus.activeSlot,
+                failoverNote = failoverStatus.failoverNote
             )
         }
 
@@ -1317,20 +1330,44 @@ class SignalRepository(
         )
     }
 
-    suspend fun saveIntegration(provider: String, configJson: String, secrets: Map<String, String>) {
+    suspend fun saveIntegration(
+        provider: String,
+        configJson: String,
+        secrets: Map<String, String>,
+        removeSecretKeys: Collection<String> = emptyList()
+    ) {
         if (provider !in SUPPORTED_PROVIDERS) throw IllegalArgumentException("Unsupported provider")
         val now = TimeUtils.utcNowIso()
+        if (removeSecretKeys.isNotEmpty()) {
+            secretStore.removeProviderSecretKeys(provider, removeSecretKeys)
+        }
         if (secrets.isNotEmpty()) {
             secretStore.putProviderSecrets(provider, secrets)
         }
+        // Reset failover cooldowns immediately whenever credentials are updated
+        verificationService.failover.resetProvider(provider)
         db.coreDao().upsertIntegration(provider, configJson, "configured", now)
         db.coreDao().insertSystemLog(SystemLogEntity(createdAt = now, severity = "INFO", source = "integrations", message = "Updated $provider configuration"))
+        eventBus.emit(AppEvent("server.status", null, "integration_updated", provider, now))
+    }
+
+    suspend fun clearBackupCredentials(provider: String) {
+        val keysToRemove = when (provider) {
+            "twelve_data" -> ProviderFailoverManager.TWELVE_DATA_BACKUP_KEYS
+            "angel_one" -> ProviderFailoverManager.ANGEL_ONE_BACKUP_KEYS
+            else -> throw IllegalArgumentException("Backup credentials not supported for $provider")
+        }
+        val now = TimeUtils.utcNowIso()
+        secretStore.removeProviderSecretKeys(provider, keysToRemove)
+        verificationService.failover.resetProvider(provider)
+        db.coreDao().insertSystemLog(SystemLogEntity(createdAt = now, severity = "INFO", source = "integrations", message = "Cleared $provider backup API credentials"))
         eventBus.emit(AppEvent("server.status", null, "integration_updated", provider, now))
     }
 
     suspend fun deleteIntegration(provider: String) {
         val now = TimeUtils.utcNowIso()
         secretStore.deleteProviderSecrets(provider)
+        verificationService.failover.resetProvider(provider)
         db.coreDao().deleteIntegration(provider)
         db.coreDao().insertSystemLog(SystemLogEntity(createdAt = now, severity = "INFO", source = "integrations", message = "Deleted $provider credentials"))
         eventBus.emit(AppEvent("server.status", null, "integration_deleted", provider, now))
@@ -1355,21 +1392,83 @@ class SignalRepository(
         }
     }
 
-    suspend fun testAngelOne(): String {
-        val secrets = secretStore.getProviderSecrets("angel_one")
+    suspend fun testTwelveData(slot: String = ProviderFailoverManager.SLOT_PRIMARY): Triple<Int, Double, String> {
+        val normSlot = if (slot.equals(ProviderFailoverManager.SLOT_BACKUP, ignoreCase = true)) {
+            ProviderFailoverManager.SLOT_BACKUP
+        } else {
+            ProviderFailoverManager.SLOT_PRIMARY
+        }
+        val integration = db.coreDao().getIntegration("twelve_data")
+        val cfg = (integration?.let { jsonToMap(it.configJson) } ?: emptyMap()).toMutableMap().apply {
+            put("outputsize", 2)
+        }
+        val secrets = secretStore.getProviderSecrets("twelve_data")
+        val apiKey = if (normSlot == ProviderFailoverManager.SLOT_BACKUP) {
+            secrets["backup_api_key"].orEmpty()
+        } else {
+            secrets["api_key"].orEmpty()
+        }
+        if (apiKey.isBlank()) {
+            val label = if (normSlot == ProviderFailoverManager.SLOT_BACKUP) "Backup" else "Primary"
+            throw ProviderError("Twelve Data $label API key is not configured.", null, "auth_error")
+        }
         return try {
-            val (_, authAt) = providers.authenticateAngelOne(secrets, forceRefresh = true)
+            val (candles, credits) = providers.fetchTwelveDataCandles("EUR/USD", "1min", null, null, cfg, apiKey)
+            verificationService.failover.recordSlotSuccess("twelve_data", normSlot)
             val now = TimeUtils.utcNowIso()
-            db.coreDao().updateIntegrationStatus("angel_one", "connected", now)
-            db.coreDao().insertSystemLog(SystemLogEntity(createdAt = now, severity = "INFO", source = "angel_one", message = "Authentication succeeded."))
-            verificationService.recordApiCall("angel_one", "/loginByPassword", "success", 200, "ok")
-            authAt
+            db.coreDao().updateIntegrationStatus("twelve_data", "connected", now)
+            verificationService.recordApiCall("twelve_data", "/time_series", "success", 200, "ok", credits, candles.size, null, "EUR/USD [$normSlot]")
+            Triple(candles.size, credits, normSlot)
         } catch (e: ProviderError) {
-            verificationService.recordApiCall("angel_one", "/loginByPassword", "error", e.httpCode, e.category, 0.0, 0, e.message)
+            verificationService.failover.recordSlotFailure("twelve_data", normSlot, e.category, e.httpCode, e.message)
+            verificationService.recordApiCall("twelve_data", "/time_series", "error", e.httpCode, e.category, 0.0, 0, "[$normSlot] ${e.message}", "EUR/USD [$normSlot]")
             throw e
         } catch (e: Exception) {
             val cat = ProviderErrorClassifier.classify(null, e.message)
-            verificationService.recordApiCall("angel_one", "/loginByPassword", "error", null, cat, 0.0, 0, e.message)
+            verificationService.failover.recordSlotFailure("twelve_data", normSlot, cat, null, e.message)
+            verificationService.recordApiCall("twelve_data", "/time_series", "error", null, cat, 0.0, 0, "[$normSlot] ${e.message}", "EUR/USD [$normSlot]")
+            throw e
+        }
+    }
+
+    suspend fun testAngelOne(slot: String = ProviderFailoverManager.SLOT_PRIMARY): String {
+        val normSlot = if (slot.equals(ProviderFailoverManager.SLOT_BACKUP, ignoreCase = true)) {
+            ProviderFailoverManager.SLOT_BACKUP
+        } else {
+            ProviderFailoverManager.SLOT_PRIMARY
+        }
+        val rawSecrets = secretStore.getProviderSecrets("angel_one")
+        val accountSecrets = if (normSlot == ProviderFailoverManager.SLOT_BACKUP) {
+            mapOf(
+                "api_key" to rawSecrets["backup_api_key"].orEmpty(),
+                "client_id" to rawSecrets["backup_client_id"].orEmpty(),
+                "password" to rawSecrets["backup_password"].orEmpty(),
+                "totp_secret" to rawSecrets["backup_totp_secret"].orEmpty()
+            )
+        } else {
+            mapOf(
+                "api_key" to rawSecrets["api_key"].orEmpty(),
+                "client_id" to rawSecrets["client_id"].orEmpty(),
+                "password" to rawSecrets["password"].orEmpty(),
+                "totp_secret" to rawSecrets["totp_secret"].orEmpty()
+            )
+        }
+        return try {
+            val (_, authAt) = providers.authenticateAngelOne(accountSecrets, forceRefresh = true)
+            verificationService.failover.recordSlotSuccess("angel_one", normSlot)
+            val now = TimeUtils.utcNowIso()
+            db.coreDao().updateIntegrationStatus("angel_one", "connected", now)
+            db.coreDao().insertSystemLog(SystemLogEntity(createdAt = now, severity = "INFO", source = "angel_one", message = "Authentication succeeded ($normSlot account)."))
+            verificationService.recordApiCall("angel_one", "/loginByPassword", "success", 200, "ok", 0.0, 0, null, "auth [$normSlot]")
+            authAt
+        } catch (e: ProviderError) {
+            verificationService.failover.recordSlotFailure("angel_one", normSlot, e.category, e.httpCode, e.message)
+            verificationService.recordApiCall("angel_one", "/loginByPassword", "error", e.httpCode, e.category, 0.0, 0, "[$normSlot] ${e.message}", "auth [$normSlot]")
+            throw e
+        } catch (e: Exception) {
+            val cat = ProviderErrorClassifier.classify(null, e.message)
+            verificationService.failover.recordSlotFailure("angel_one", normSlot, cat, null, e.message)
+            verificationService.recordApiCall("angel_one", "/loginByPassword", "error", null, cat, 0.0, 0, "[$normSlot] ${e.message}", "auth [$normSlot]")
             throw e
         }
     }
@@ -1440,30 +1539,15 @@ class SignalRepository(
 
     suspend fun fetchManualTwelveDataCandles(symbol: String, interval: String, startIso: String?, endIso: String?): Triple<Int, Int, Double> {
         val integration = db.coreDao().getIntegration("twelve_data")
-            ?: throw ProviderError("Configure Twelve Data first.", category = "auth_error")
-        val apiKey = secretStore.getProviderSecrets("twelve_data")["api_key"].orEmpty()
-        val cfg = jsonToMap(integration.configJson)
+        val cfg = integration?.let { jsonToMap(it.configJson) } ?: emptyMap()
         val start = startIso?.takeIf { it.isNotBlank() }?.let { TimeUtils.parseUtcInstant(it) }
         val end = endIso?.takeIf { it.isNotBlank() }?.let { TimeUtils.parseUtcInstant(it) }
-        return try {
-            val (candles, credits) = providers.fetchTwelveDataCandles(symbol, interval, start, end, cfg, apiKey)
-            val stored = verificationService.storeCandles(candles)
-            verificationService.recordApiCall("twelve_data", "/time_series", "success", 200, "ok", credits, candles.size)
-            Triple(candles.size, stored, credits)
-        } catch (e: ProviderError) {
-            verificationService.recordApiCall("twelve_data", "/time_series", "error", e.httpCode, e.category, 0.0, 0, e.message)
-            throw e
-        } catch (e: Exception) {
-            val cat = ProviderErrorClassifier.classify(null, e.message)
-            verificationService.recordApiCall("twelve_data", "/time_series", "error", null, cat, 0.0, 0, e.message)
-            throw e
-        }
+        val (candles, credits, _) = verificationService.fetchTwelveDataWithFailover(symbol, interval, start, end, cfg)
+        val stored = verificationService.storeCandles(candles)
+        return Triple(candles.size, stored, credits)
     }
 
     suspend fun fetchManualAngelCandles(exchange: String, token: String, rawInterval: String, startIso: String, endIso: String): Pair<Int, Int> {
-        val secrets = secretStore.getProviderSecrets("angel_one")
-        val apiKey = secrets["api_key"].orEmpty()
-        if (apiKey.isBlank()) throw ProviderError("Angel One is not configured.", category = "auth_error")
         val start = TimeUtils.parseUtcInstant(startIso) ?: throw IllegalArgumentException("Invalid start time")
         val end = TimeUtils.parseUtcInstant(endIso) ?: throw IllegalArgumentException("Invalid end time")
         if (!end.isAfter(start)) throw IllegalArgumentException("End time must be later than start time.")
@@ -1471,20 +1555,16 @@ class SignalRepository(
         val tok = token.trim()
         if (exch.isEmpty() || tok.isEmpty()) throw IllegalArgumentException("Select a valid exchange and contract token first.")
         val interval = ANGEL_INTERVAL_MAP[rawInterval.trim()] ?: rawInterval.trim()
-        return try {
-            val jwt = providers.authenticateAngelOne(secrets).first
-            val candles = providers.fetchAngelCandles(jwt, apiKey, exch, tok, interval, angelDateFmt.format(start), angelDateFmt.format(end))
-            val stored = verificationService.storeCandles(candles)
-            verificationService.recordApiCall("angel_one", "/getCandleData", "success", 200, "ok", 0.0, candles.size)
-            candles.size to stored
-        } catch (e: ProviderError) {
-            verificationService.recordApiCall("angel_one", "/getCandleData", "error", e.httpCode, e.category, 0.0, 0, e.message)
-            throw e
-        } catch (e: Exception) {
-            val cat = ProviderErrorClassifier.classify(null, e.message)
-            verificationService.recordApiCall("angel_one", "/getCandleData", "error", null, cat, 0.0, 0, e.message)
-            throw e
-        }
+        val (candles, _) = verificationService.fetchAngelCandlesWithFailover(
+            exchange = exch,
+            token = tok,
+            interval = interval,
+            fromStr = angelDateFmt.format(start),
+            toStr = angelDateFmt.format(end),
+            requestKey = "$exch:$tok"
+        )
+        val stored = verificationService.storeCandles(candles)
+        return candles.size to stored
     }
 
     suspend fun getTwelveDataUsage(): Map<String, Double> {
@@ -1492,8 +1572,12 @@ class SignalRepository(
         val day = now.toString().take(10)
         val minute = now.toString().take(16)
         val settings = getSettings()
-        val daily = settings["twelve_daily_credits"]?.toDoubleOrNull() ?: 800.0
-        val perMin = settings["twelve_minute_credits"]?.toDoubleOrNull() ?: 8.0
+        val secrets = secretStore.getProviderSecrets("twelve_data")
+        val keyCount = verificationService.failover.twelveDataAccounts(secrets).size.coerceAtLeast(1)
+        val dailyPerKey = settings["twelve_daily_credits"]?.toDoubleOrNull() ?: 800.0
+        val perMinPerKey = settings["twelve_minute_credits"]?.toDoubleOrNull() ?: 8.0
+        val daily = dailyPerKey * keyCount
+        val perMin = perMinPerKey * keyCount
         val used = db.marketDao().sumCreditsForDay("twelve_data", day)
         val minUsed = db.marketDao().sumCreditsForMinute("twelve_data", minute)
         return mapOf(
@@ -1502,7 +1586,8 @@ class SignalRepository(
             "daily_remaining" to maxOf(0.0, daily - used),
             "minute_allowance" to perMin,
             "minute_used" to minUsed,
-            "minute_remaining" to maxOf(0.0, perMin - minUsed)
+            "minute_remaining" to maxOf(0.0, perMin - minUsed),
+            "configured_keys" to keyCount.toDouble()
         )
     }
 

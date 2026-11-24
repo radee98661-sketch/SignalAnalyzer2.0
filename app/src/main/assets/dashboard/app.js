@@ -1750,6 +1750,40 @@ async function integrations() {
   [['google_sheets', $('#sheets-form')], ['binance', $('#binance-config')], ['twelve_data', $('#twelve-form')]].forEach(([id, f]) =>
     Object.entries(by[id]?.config || {}).forEach(([k, v]) => f[k] && (f[k].value = Array.isArray(v) ? v.join(', ') : v))
   );
+  const td = by['twelve_data'];
+  const tdBadge = $('#twelve-backup-badge');
+  if (tdBadge) {
+    const hasB = !!td?.has_backup_secrets;
+    tdBadge.textContent = hasB ? 'BACKUP READY (2 KEYS)' : (td?.has_primary_secrets ? 'PRIMARY ONLY (1 KEY)' : 'UNCONFIGURED');
+    tdBadge.className = `pill ${hasB ? 'badge-green' : 'badge-muted'}`;
+  }
+  const tdForm = $('#twelve-form');
+  if (tdForm) {
+    if (tdForm.api_key) tdForm.api_key.placeholder = td?.has_primary_secrets ? 'Saved (leave empty to keep)' : 'Enter primary Twelve Data API key';
+    if (tdForm.backup_api_key) tdForm.backup_api_key.placeholder = td?.has_backup_secrets ? 'Saved (leave empty to keep)' : 'Optional 2nd account key — used if Primary hits limit';
+  }
+  if ($('#twelve-test-backup')) $('#twelve-test-backup').style.display = td?.has_backup_secrets ? '' : 'none';
+  if ($('#twelve-clear-backup')) $('#twelve-clear-backup').style.display = td?.has_backup_secrets ? '' : 'none';
+
+  const ao = by['angel_one'];
+  const aoBadge = $('#angel-backup-badge');
+  if (aoBadge) {
+    const hasB = !!ao?.has_backup_secrets;
+    aoBadge.textContent = hasB ? 'BACKUP READY (2 ACCOUNTS)' : (ao?.has_primary_secrets ? 'PRIMARY ONLY' : 'UNCONFIGURED');
+    aoBadge.className = `pill ${hasB ? 'badge-green' : 'badge-muted'}`;
+  }
+  const aoForm = $('#angel-form');
+  if (aoForm) {
+    const sf = new Set(ao?.secret_fields || []);
+    ['api_key', 'client_id', 'password', 'totp_secret'].forEach(k => {
+      if (aoForm[k]) aoForm[k].placeholder = sf.has(k) ? 'Saved (leave empty to keep)' : 'Not saved yet';
+    });
+    ['backup_api_key', 'backup_client_id', 'backup_password', 'backup_totp_secret'].forEach(k => {
+      if (aoForm[k]) aoForm[k].placeholder = sf.has(k) ? 'Saved (leave empty to keep)' : 'Optional 2nd account credential';
+    });
+  }
+  if ($('#angel-test-backup')) $('#angel-test-backup').style.display = ao?.has_backup_secrets ? '' : 'none';
+  if ($('#angel-clear-backup')) $('#angel-clear-backup').style.display = ao?.has_backup_secrets ? '' : 'none';
 }
 
 async function coverage() {
@@ -1884,17 +1918,21 @@ async function loadApiHealth() {
       <div class="health-grid">
         ${providers.map(p => {
           const [lbl, cls] = badgeFor(p.status);
+          const failoverBadge = p.active_slot === 'backup'
+            ? '<span class="pill badge-orange">BACKUP ACTIVE</span>'
+            : (p.backup_configured ? '<span class="pill badge-green">BACKUP READY</span>' : '');
           return `<div class="health-card">
-            <div class="health-card-head"><b>${esc(p.display_name)}</b><span class="pill ${cls}">${esc(lbl)}</span></div>
+            <div class="health-card-head"><b>${esc(p.display_name)}</b><span style="display:flex;gap:5px;align-items:center;flex-wrap:wrap">${failoverBadge}<span class="pill ${cls}">${esc(lbl)}</span></span></div>
             <div class="muted" style="font-size:11px">24h Calls: <b>${esc(p.calls_24h)}</b> &bull; Errors: <b>${esc(p.errors_24h)}</b> &bull; 429/Quota: <b>${esc(p.rate_limit_hits_24h)}</b></div>
+            ${p.failover_note ? `<div style="font-size:11px;color:${p.active_slot === 'backup' ? '#fbbf24' : '#62d6a5'}">${esc(p.failover_note)}</div>` : ''}
             ${p.last_error_message ? `<div style="font-size:11px;color:${p.status === 'degraded' ? '#fbbf24' : '#ff7285'}">${esc(p.last_error_category || 'error')}${p.last_http_code ? ` (HTTP ${p.last_http_code})` : ''}: ${esc(p.last_error_message)}</div>` : '<div class="muted" style="font-size:11px">No recent errors.</div>'}
           </div>`;
         }).join('')}
       </div>
       <div class="quota-bar-wrap">
-        <div class="muted" style="font-size:11px">Twelve Data Minute Quota: <b>${Math.round(u.minute_used || 0)} / ${Math.round(u.minute_allowance || 8)}</b> credits (${minPct}%)</div>
+        <div class="muted" style="font-size:11px">Twelve Data Minute Quota${u.configured_keys > 1 ? ` (${Math.round(u.configured_keys)} keys combined)` : ''}: <b>${Math.round(u.minute_used || 0)} / ${Math.round(u.minute_allowance || 8)}</b> credits (${minPct}%)</div>
         <div class="quota-bar"><i style="width:${minPct}%;background:${minPct >= 90 ? '#ff7285' : minPct >= 70 ? '#f59e0b' : '#62d6a5'}"></i></div>
-        <div class="muted" style="font-size:11px">Twelve Data Daily Quota: <b>${Math.round(u.daily_used || 0)} / ${Math.round(u.daily_allowance || 800)}</b> credits (${dayPct}%)</div>
+        <div class="muted" style="font-size:11px">Twelve Data Daily Quota${u.configured_keys > 1 ? ` (${Math.round(u.configured_keys)} keys combined)` : ''}: <b>${Math.round(u.daily_used || 0)} / ${Math.round(u.daily_allowance || 800)}</b> credits (${dayPct}%)</div>
         <div class="quota-bar"><i style="width:${dayPct}%;background:${dayPct >= 90 ? '#ff7285' : dayPct >= 75 ? '#f59e0b' : '#60a5fa'}"></i></div>
       </div>`;
   }
@@ -2244,11 +2282,57 @@ $('#binance-config').onsubmit = async e => { e.preventDefault(); await api('/api
 $('#binance-test').onclick = () => busy($('#binance-test'), 'Testing...', async () => { try { $('#binance-result').textContent = JSON.stringify(await api('/api/v1/binance/test', { method: 'POST' })); } catch (e) { $('#binance-result').textContent = e.message; } });
 $('#twelve-form').onsubmit = async e => {
   e.preventDefault(); let d = Object.fromEntries(new FormData(e.target));
-  await api('/api/v1/integrations/twelve_data', { method: 'POST', body: JSON.stringify({ config: { base_url: d.base_url, symbols: d.symbols.split(',').map(x => x.trim()).filter(Boolean), timezone: d.timezone, outputsize: 5000 }, secrets: { api_key: d.api_key } }) });
-  $('#twelve-result').textContent = 'Saved; API key is encrypted in Android Keystore.';
+  const secrets = {};
+  if ((d.api_key || '').trim()) secrets.api_key = d.api_key.trim();
+  if ((d.backup_api_key || '').trim()) secrets.backup_api_key = d.backup_api_key.trim();
+  await api('/api/v1/integrations/twelve_data', { method: 'POST', body: JSON.stringify({ config: { base_url: d.base_url, symbols: d.symbols.split(',').map(x => x.trim()).filter(Boolean), timezone: d.timezone, outputsize: 5000 }, secrets }) });
+  e.target.api_key.value = '';
+  if (e.target.backup_api_key) e.target.backup_api_key.value = '';
+  $('#twelve-result').textContent = 'Saved; API key(s) encrypted in Android Keystore.';
+  await integrations();
+  loadApiHealth();
 };
-$('#angel-form').onsubmit = async e => { e.preventDefault(); await api('/api/v1/integrations/angel_one', { method: 'POST', body: JSON.stringify({ config: {}, secrets: Object.fromEntries(new FormData(e.target)) }) }); $('#angel-result').textContent = 'Saved; credentials encrypted in Android Keystore.'; };
-$('#angel-test').onclick = async () => { try { $('#angel-result').textContent = JSON.stringify(await api('/api/v1/angel-one/test', { method: 'POST' })); } catch (e) { $('#angel-result').textContent = e.message; } };
+if ($('#twelve-test-primary')) $('#twelve-test-primary').onclick = () => busy($('#twelve-test-primary'), 'Testing...', async () => {
+  try { $('#twelve-result').textContent = JSON.stringify(await api('/api/v1/twelve-data/test', { method: 'POST', body: JSON.stringify({ slot: 'primary' }) })); loadApiHealth(); } catch (e) { $('#twelve-result').textContent = e.message; }
+});
+if ($('#twelve-test-backup')) $('#twelve-test-backup').onclick = () => busy($('#twelve-test-backup'), 'Testing...', async () => {
+  try { $('#twelve-result').textContent = JSON.stringify(await api('/api/v1/twelve-data/test', { method: 'POST', body: JSON.stringify({ slot: 'backup' }) })); loadApiHealth(); } catch (e) { $('#twelve-result').textContent = e.message; }
+});
+if ($('#twelve-clear-backup')) $('#twelve-clear-backup').onclick = async () => {
+  if (!confirm('Remove saved Backup Twelve Data API key?')) return;
+  try {
+    await api('/api/v1/integrations/twelve_data/backup', { method: 'DELETE' });
+    $('#twelve-result').textContent = 'Cleared Backup Twelve Data API key.';
+    await integrations();
+    loadApiHealth();
+  } catch (e) { $('#twelve-result').textContent = e.message; }
+};
+$('#angel-form').onsubmit = async e => {
+  e.preventDefault();
+  const raw = Object.fromEntries(new FormData(e.target));
+  const secrets = {};
+  Object.entries(raw).forEach(([k, v]) => { if ((v || '').trim()) secrets[k] = v.trim(); });
+  await api('/api/v1/integrations/angel_one', { method: 'POST', body: JSON.stringify({ config: {}, secrets }) });
+  e.target.reset();
+  $('#angel-result').textContent = 'Saved; credentials encrypted in Android Keystore.';
+  await integrations();
+  loadApiHealth();
+};
+$('#angel-test').onclick = () => busy($('#angel-test'), 'Testing...', async () => {
+  try { $('#angel-result').textContent = JSON.stringify(await api('/api/v1/angel-one/test', { method: 'POST', body: JSON.stringify({ slot: 'primary' }) })); loadApiHealth(); } catch (e) { $('#angel-result').textContent = e.message; }
+});
+if ($('#angel-test-backup')) $('#angel-test-backup').onclick = () => busy($('#angel-test-backup'), 'Testing...', async () => {
+  try { $('#angel-result').textContent = JSON.stringify(await api('/api/v1/angel-one/test', { method: 'POST', body: JSON.stringify({ slot: 'backup' }) })); loadApiHealth(); } catch (e) { $('#angel-result').textContent = e.message; }
+});
+if ($('#angel-clear-backup')) $('#angel-clear-backup').onclick = async () => {
+  if (!confirm('Remove saved Backup Angel One credentials?')) return;
+  try {
+    await api('/api/v1/integrations/angel_one/backup', { method: 'DELETE' });
+    $('#angel-result').textContent = 'Cleared Backup Angel One credentials.';
+    await integrations();
+    loadApiHealth();
+  } catch (e) { $('#angel-result').textContent = e.message; }
+};
 $('#master-refresh').onclick = async () => { try { $('#angel-result').textContent = JSON.stringify(await api('/api/v1/angel-one/instruments/refresh', { method: 'POST' })); } catch (e) { $('#angel-result').textContent = e.message; } };
 $('#market-master-refresh').onclick = () => busy($('#market-master-refresh'), 'Refreshing...', async () => { try { const r = await api('/api/v1/angel-one/instruments/refresh', { method: 'POST' }); $('#candle-result').textContent = `Updated ${r.count} instruments.`; await loadAngelCatalog(true, true); } catch (e) { $('#candle-result').textContent = e.message; } });
 $('#candle-provider').onchange = updateProviderUI;

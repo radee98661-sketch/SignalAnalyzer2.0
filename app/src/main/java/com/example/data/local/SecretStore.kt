@@ -17,6 +17,7 @@ interface SecretStore {
     fun getProviderSecrets(provider: String): Map<String, String>
     fun getProviderSecretFieldNames(provider: String): List<String>
     fun putProviderSecrets(provider: String, updates: Map<String, String>)
+    fun removeProviderSecretKeys(provider: String, keys: Collection<String>)
     fun deleteProviderSecrets(provider: String)
 
     fun getOrCreateLanBearerToken(): String
@@ -112,6 +113,24 @@ class AndroidKeystoreSecretStore(context: Context) : SecretStore {
     }
 
     @Synchronized
+    override fun removeProviderSecretKeys(provider: String, keys: Collection<String>) {
+        if (keys.isEmpty()) return
+        val merged = getProviderSecrets(provider).toMutableMap()
+        var changed = false
+        for (k in keys) {
+            if (merged.remove(k) != null) changed = true
+        }
+        if (!changed) return
+        if (merged.isEmpty()) {
+            prefs.edit().remove("provider_$provider").apply()
+        } else {
+            val obj = JSONObject()
+            for ((k, v) in merged) obj.put(k, v)
+            prefs.edit().putString("provider_$provider", encrypt(obj.toString())).apply()
+        }
+    }
+
+    @Synchronized
     override fun deleteProviderSecrets(provider: String) {
         prefs.edit().remove("provider_$provider").apply()
     }
@@ -172,6 +191,12 @@ class InMemorySecretStore : SecretStore {
         for ((k, v) in updates) {
             if (v.isNotEmpty()) m[k] = v
         }
+    }
+
+    override fun removeProviderSecretKeys(provider: String, keys: Collection<String>) {
+        val m = map[provider] ?: return
+        for (k in keys) m.remove(k)
+        if (m.isEmpty()) map.remove(provider)
     }
 
     override fun deleteProviderSecrets(provider: String) {

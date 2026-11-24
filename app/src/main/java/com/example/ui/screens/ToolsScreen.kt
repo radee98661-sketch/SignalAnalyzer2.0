@@ -25,6 +25,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
@@ -51,6 +52,7 @@ import com.example.ui.theme.EmeraldAccent
 import com.example.ui.theme.EmeraldContainer
 import com.example.ui.theme.MonoFontFamily
 import com.example.ui.theme.NavyBorder
+import com.example.ui.theme.NavyCardElevated
 import com.example.ui.theme.NavyInput
 import com.example.ui.theme.TextSecondary
 import com.example.ui.viewmodel.MainViewModel
@@ -189,10 +191,15 @@ private fun ParseAndImportTab(viewModel: MainViewModel) {
 @Composable
 private fun IntegrationsTab(viewModel: MainViewModel) {
     val integrations by viewModel.integrations.collectAsStateWithLifecycle()
+    val secretFields by viewModel.integrationSecretFields.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val isBusy by viewModel.isBusy.collectAsStateWithLifecycle()
 
     val byProvider = remember(integrations) { integrations.associateBy { it.provider } }
+    val twelveFields = secretFields["twelve_data"].orEmpty()
+    val angelFields = secretFields["angel_one"].orEmpty()
+    val hasTwelveBackup = "backup_api_key" in twelveFields
+    val hasAngelBackup = listOf("backup_api_key", "backup_client_id", "backup_password", "backup_totp_secret").all { it in angelFields }
 
     var sheetsUrl by remember { mutableStateOf("") }
     var sheetsToken by remember { mutableStateOf("") }
@@ -201,12 +208,17 @@ private fun IntegrationsTab(viewModel: MainViewModel) {
 
     var binanceBaseUrl by remember { mutableStateOf("https://fapi.binance.com") }
     var twelveApiKey by remember { mutableStateOf("") }
+    var twelveBackupApiKey by remember { mutableStateOf("") }
     var twelveBaseUrl by remember { mutableStateOf("https://api.twelvedata.com") }
 
     var angelApiKey by remember { mutableStateOf("") }
     var angelClientId by remember { mutableStateOf("") }
     var angelPassword by remember { mutableStateOf("") }
     var angelTotp by remember { mutableStateOf("") }
+    var angelBackupApiKey by remember { mutableStateOf("") }
+    var angelBackupClientId by remember { mutableStateOf("") }
+    var angelBackupPassword by remember { mutableStateOf("") }
+    var angelBackupTotp by remember { mutableStateOf("") }
 
     LaunchedEffect(integrations, settings) {
         byProvider["google_sheets"]?.configJson?.let { raw ->
@@ -324,13 +336,31 @@ private fun IntegrationsTab(viewModel: MainViewModel) {
 
         // Twelve Data
         item {
-            SectionCard(title = "Twelve Data — Forex", subtitle = "Forex & metals historical candles (XAU/USD, EUR/USD, WTI/USD).") {
+            SectionCard(
+                title = "Twelve Data — Forex",
+                subtitle = "Forex & metals historical candles (XAU/USD, EUR/USD, WTI/USD). Automatically routes to Backup API key when Primary hits daily/minute limit.",
+                action = {
+                    if (hasTwelveBackup) {
+                        StatusPill("BACKUP READY", EmeraldContainer, EmeraldAccent)
+                    } else {
+                        StatusPill("1 KEY", NavyCardElevated, TextSecondary)
+                    }
+                }
+            ) {
                 OutlinedTextField(
                     value = twelveApiKey,
                     onValueChange = { twelveApiKey = it },
-                    label = { Text("API Key (leave blank to keep saved)") },
+                    label = { Text(if ("api_key" in twelveFields) "Primary API Key (saved — leave blank to keep)" else "Primary API Key") },
                     visualTransformation = PasswordVisualTransformation(),
                     modifier = Modifier.fillMaxWidth().testTag("twelve_key_input"),
+                    singleLine = true
+                )
+                OutlinedTextField(
+                    value = twelveBackupApiKey,
+                    onValueChange = { twelveBackupApiKey = it },
+                    label = { Text(if (hasTwelveBackup) "Secondary / Backup API Key (saved — leave blank to keep)" else "Secondary / Backup API Key (Auto-Failover)") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth().testTag("twelve_backup_key_input"),
                     singleLine = true
                 )
                 OutlinedTextField(
@@ -340,29 +370,73 @@ private fun IntegrationsTab(viewModel: MainViewModel) {
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true
                 )
-                Button(
-                    onClick = {
-                        val cfg = JSONObject().apply {
-                            put("base_url", twelveBaseUrl.trim())
-                            put("timezone", "UTC")
-                            put("outputsize", 5000)
-                        }
-                        val sec = if (twelveApiKey.isNotBlank()) mapOf("api_key" to twelveApiKey.trim()) else emptyMap()
-                        viewModel.saveIntegration("twelve_data", cfg, sec)
-                        twelveApiKey = ""
-                    },
-                    modifier = Modifier.fillMaxWidth().testTag("save_twelve_button")
-                ) { Text("Save Twelve Data") }
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = {
+                            val cfg = JSONObject().apply {
+                                put("base_url", twelveBaseUrl.trim())
+                                put("timezone", "UTC")
+                                put("outputsize", 5000)
+                            }
+                            val sec = buildMap {
+                                if (twelveApiKey.isNotBlank()) put("api_key", twelveApiKey.trim())
+                                if (twelveBackupApiKey.isNotBlank()) put("backup_api_key", twelveBackupApiKey.trim())
+                            }
+                            viewModel.saveIntegration("twelve_data", cfg, sec)
+                            twelveApiKey = ""
+                            twelveBackupApiKey = ""
+                        },
+                        modifier = Modifier.weight(1f).testTag("save_twelve_button")
+                    ) { Text("Save") }
+                    FilledTonalButton(
+                        onClick = { viewModel.testTwelveData("primary") },
+                        enabled = !isBusy,
+                        modifier = Modifier.weight(1f).testTag("test_twelve_primary_button")
+                    ) { Text("Test Primary") }
+                }
+                if (hasTwelveBackup) {
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilledTonalButton(
+                            onClick = { viewModel.testTwelveData("backup") },
+                            enabled = !isBusy,
+                            modifier = Modifier.weight(1f).testTag("test_twelve_backup_button")
+                        ) { Text("Test Backup") }
+                        OutlinedButton(
+                            onClick = { viewModel.clearBackupCredentials("twelve_data") },
+                            enabled = !isBusy,
+                            modifier = Modifier.weight(1f).testTag("clear_twelve_backup_button")
+                        ) { Text("Clear Backup") }
+                    }
+                }
             }
         }
 
         // Angel One
         item {
-            SectionCard(title = "Angel One SmartAPI", subtitle = "Index Options, Stock Options & MCX verification using RFC 6238 TOTP & Scrip Master.") {
-                OutlinedTextField(value = angelApiKey, onValueChange = { angelApiKey = it }, label = { Text("API Key") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(), singleLine = true)
-                OutlinedTextField(value = angelClientId, onValueChange = { angelClientId = it }, label = { Text("Client ID") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(), singleLine = true)
-                OutlinedTextField(value = angelPassword, onValueChange = { angelPassword = it }, label = { Text("Password / PIN") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(), singleLine = true)
-                OutlinedTextField(value = angelTotp, onValueChange = { angelTotp = it }, label = { Text("TOTP Secret (Base32)") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(), singleLine = true)
+            SectionCard(
+                title = "Angel One SmartAPI",
+                subtitle = "Index Options, Stock Options & MCX verification. Automatically fails over to Backup account on rate limit or auth error.",
+                action = {
+                    if (hasAngelBackup) {
+                        StatusPill("BACKUP READY", EmeraldContainer, EmeraldAccent)
+                    } else {
+                        StatusPill("PRIMARY ONLY", NavyCardElevated, TextSecondary)
+                    }
+                }
+            ) {
+                Text("Primary Account", style = MaterialTheme.typography.labelMedium, color = TextSecondary)
+                OutlinedTextField(value = angelApiKey, onValueChange = { angelApiKey = it }, label = { Text(if ("api_key" in angelFields) "Primary API Key (saved)" else "Primary API Key") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(), singleLine = true)
+                OutlinedTextField(value = angelClientId, onValueChange = { angelClientId = it }, label = { Text(if ("client_id" in angelFields) "Primary Client ID (saved)" else "Primary Client ID") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(), singleLine = true)
+                OutlinedTextField(value = angelPassword, onValueChange = { angelPassword = it }, label = { Text(if ("password" in angelFields) "Primary Password / PIN (saved)" else "Primary Password / PIN") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(), singleLine = true)
+                OutlinedTextField(value = angelTotp, onValueChange = { angelTotp = it }, label = { Text(if ("totp_secret" in angelFields) "Primary TOTP Secret (saved)" else "Primary TOTP Secret (Base32)") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(), singleLine = true)
+
+                HorizontalDivider(color = NavyBorder)
+                Text("Secondary / Backup Account (Auto-Failover)", style = MaterialTheme.typography.labelMedium, color = EmeraldAccent)
+                OutlinedTextField(value = angelBackupApiKey, onValueChange = { angelBackupApiKey = it }, label = { Text(if ("backup_api_key" in angelFields) "Backup API Key (saved)" else "Backup API Key") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth().testTag("angel_backup_key_input"), singleLine = true)
+                OutlinedTextField(value = angelBackupClientId, onValueChange = { angelBackupClientId = it }, label = { Text(if ("backup_client_id" in angelFields) "Backup Client ID (saved)" else "Backup Client ID") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(), singleLine = true)
+                OutlinedTextField(value = angelBackupPassword, onValueChange = { angelBackupPassword = it }, label = { Text(if ("backup_password" in angelFields) "Backup Password / PIN (saved)" else "Backup Password / PIN") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(), singleLine = true)
+                OutlinedTextField(value = angelBackupTotp, onValueChange = { angelBackupTotp = it }, label = { Text(if ("backup_totp_secret" in angelFields) "Backup TOTP Secret (saved)" else "Backup TOTP Secret (Base32)") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(), singleLine = true)
+
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
                         onClick = {
@@ -371,22 +445,41 @@ private fun IntegrationsTab(viewModel: MainViewModel) {
                                 if (angelClientId.isNotBlank()) put("client_id", angelClientId.trim())
                                 if (angelPassword.isNotBlank()) put("password", angelPassword.trim())
                                 if (angelTotp.isNotBlank()) put("totp_secret", angelTotp.trim())
+                                if (angelBackupApiKey.isNotBlank()) put("backup_api_key", angelBackupApiKey.trim())
+                                if (angelBackupClientId.isNotBlank()) put("backup_client_id", angelBackupClientId.trim())
+                                if (angelBackupPassword.isNotBlank()) put("backup_password", angelBackupPassword.trim())
+                                if (angelBackupTotp.isNotBlank()) put("backup_totp_secret", angelBackupTotp.trim())
                             }
                             viewModel.saveIntegration("angel_one", JSONObject(), sec)
                             angelApiKey = ""; angelClientId = ""; angelPassword = ""; angelTotp = ""
+                            angelBackupApiKey = ""; angelBackupClientId = ""; angelBackupPassword = ""; angelBackupTotp = ""
                         },
                         modifier = Modifier.weight(1f).testTag("save_angel_button")
                     ) { Text("Save") }
                     FilledTonalButton(
-                        onClick = { viewModel.testAngelOne() },
+                        onClick = { viewModel.testAngelOne("primary") },
                         enabled = !isBusy,
                         modifier = Modifier.weight(1f).testTag("test_angel_button")
-                    ) { Text("Auth Test") }
+                    ) { Text("Test Primary") }
                     FilledTonalButton(
                         onClick = { viewModel.refreshAngelMaster() },
                         enabled = !isBusy,
                         modifier = Modifier.weight(1f).testTag("refresh_angel_master_button")
                     ) { Text("Master") }
+                }
+                if (hasAngelBackup) {
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilledTonalButton(
+                            onClick = { viewModel.testAngelOne("backup") },
+                            enabled = !isBusy,
+                            modifier = Modifier.weight(1f).testTag("test_angel_backup_button")
+                        ) { Text("Test Backup") }
+                        OutlinedButton(
+                            onClick = { viewModel.clearBackupCredentials("angel_one") },
+                            enabled = !isBusy,
+                            modifier = Modifier.weight(1f).testTag("clear_angel_backup_button")
+                        ) { Text("Clear Backup") }
+                    }
                 }
             }
         }

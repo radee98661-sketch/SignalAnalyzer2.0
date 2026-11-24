@@ -304,13 +304,27 @@ private fun MarketDataTab(viewModel: MainViewModel) {
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(p.displayName, style = MaterialTheme.typography.titleSmall)
-                            StatusPill(pLbl, pBg, pFg)
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                if (p.activeSlot == "backup") {
+                                    StatusPill("BACKUP ACTIVE", AmberContainer, AmberWarn)
+                                } else if (p.backupConfigured) {
+                                    StatusPill("BACKUP READY", EmeraldContainer, EmeraldAccent)
+                                }
+                                StatusPill(pLbl, pBg, pFg)
+                            }
                         }
                         Text(
                             "24h Calls: ${p.calls24h} • Errors: ${p.errors24h} • Rate/Quota Hits: ${p.rateLimitHits24h}",
                             style = MaterialTheme.typography.labelSmall.copy(fontFamily = MonoFontFamily),
                             color = TextSecondary
                         )
+                        if (!p.failoverNote.isNullOrBlank()) {
+                            Text(
+                                p.failoverNote,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (p.activeSlot == "backup") AmberWarn else EmeraldAccent
+                            )
+                        }
                         if (!p.lastErrorMessage.isNullOrBlank()) {
                             Text(
                                 "Last issue (${p.lastErrorCategory ?: "error"}${p.lastHttpCode?.let { " HTTP $it" } ?: ""} • ${formatShortTimestamp(p.lastErrorAt)}): ${p.lastErrorMessage}",

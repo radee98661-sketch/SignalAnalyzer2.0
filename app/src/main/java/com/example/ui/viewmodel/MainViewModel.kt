@@ -10,6 +10,7 @@ import com.example.data.repository.EnrichedSignal
 import com.example.data.repository.OverviewData
 import com.example.data.repository.SignalChartData
 import com.example.data.repository.SignalEditPayload
+import com.example.data.repository.SignalRepository
 import com.example.domain.model.ApiHealthSummary
 import com.example.domain.model.DefaultSlCategoryRule
 import com.example.domain.model.FilteredChannelAnalyticsRow
@@ -104,6 +105,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _integrations = MutableStateFlow<List<IntegrationEntity>>(emptyList())
     val integrations: StateFlow<List<IntegrationEntity>> = _integrations.asStateFlow()
+
+    private val _integrationSecretFields = MutableStateFlow<Map<String, Set<String>>>(emptyMap())
+    val integrationSecretFields: StateFlow<Map<String, Set<String>>> = _integrationSecretFields.asStateFlow()
 
     private val _analytics = MutableStateFlow<List<ChannelAnalyticsRow>>(emptyList())
     val analytics: StateFlow<List<ChannelAnalyticsRow>> = _analytics.asStateFlow()
@@ -428,6 +432,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun refreshIntegrations() = viewModelScope.launch(Dispatchers.IO) {
         _integrations.value = repo.db.coreDao().getAllIntegrations()
+        _integrationSecretFields.value = SignalRepository.SUPPORTED_PROVIDERS.associateWith { prov ->
+            repo.secretStore.getProviderSecretFieldNames(prov).toSet()
+        }
     }
 
     fun saveIntegration(provider: String, config: JSONObject, secrets: Map<String, String>) = viewModelScope.launch(Dispatchers.IO) {
@@ -435,6 +442,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             repo.saveIntegration(provider, config.toString(), secrets)
             _statusMessage.value = "Saved $provider configuration (secrets encrypted in Keystore)."
             refreshIntegrations()
+            refreshApiHealth()
+        } catch (e: Exception) {
+            _statusMessage.value = "Error: ${e.message}"
+        }
+    }
+
+    fun clearBackupCredentials(provider: String) = viewModelScope.launch(Dispatchers.IO) {
+        try {
+            repo.clearBackupCredentials(provider)
+            _statusMessage.value = "Cleared $provider backup API credentials."
+            refreshIntegrations()
+            refreshApiHealth()
         } catch (e: Exception) {
             _statusMessage.value = "Error: ${e.message}"
         }
@@ -465,14 +484,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun testAngelOne() = viewModelScope.launch(Dispatchers.IO) {
+    fun testTwelveData(slot: String = "primary") = viewModelScope.launch(Dispatchers.IO) {
         _isBusy.value = true
         try {
-            val at = repo.testAngelOne()
-            _statusMessage.value = "Angel One authenticated at $at"
+            val (cnt, credits, usedSlot) = repo.testTwelveData(slot)
+            _statusMessage.value = "Twelve Data ($usedSlot) OK: $cnt candles fetched (${credits.toInt()} credit)."
             refreshIntegrations()
+            refreshApiHealth()
         } catch (e: Exception) {
-            _statusMessage.value = "Angel One error: ${e.message}"
+            _statusMessage.value = "Twelve Data ($slot) error: ${e.message}"
+        } finally {
+            _isBusy.value = false
+        }
+    }
+
+    fun testAngelOne(slot: String = "primary") = viewModelScope.launch(Dispatchers.IO) {
+        _isBusy.value = true
+        try {
+            val at = repo.testAngelOne(slot)
+            _statusMessage.value = "Angel One ($slot) authenticated at $at"
+            refreshIntegrations()
+            refreshApiHealth()
+        } catch (e: Exception) {
+            _statusMessage.value = "Angel One ($slot) error: ${e.message}"
         } finally {
             _isBusy.value = false
         }

@@ -8,6 +8,7 @@ import com.example.data.local.MarketCandleEntity
 import com.example.data.local.SecretStore
 import com.example.data.local.SignalAnalysisEntity
 import com.example.data.local.SignalJoinedRow
+import com.example.data.local.SystemLogEntity
 import com.example.data.local.VerificationRunEntity
 import com.example.data.provider.MarketDataProviders
 import com.example.data.provider.ProviderError
@@ -47,7 +48,8 @@ class VerificationService(
     private val db: AppDatabase,
     private val secretStore: SecretStore,
     private val providers: MarketDataProviders,
-    private val eventBus: EventBus
+    private val eventBus: EventBus,
+    val failover: ProviderFailoverManager = ProviderFailoverManager()
 ) {
     private var lastMasterError: String? = null
     private var lastSearchScripSample: List<String> = emptyList()
@@ -236,9 +238,10 @@ class VerificationService(
     ): String? {
         lastSearchScripSample = emptyList()
         val secrets = secretStore.getProviderSecrets("angel_one")
-        if (secrets["api_key"].isNullOrBlank() || secrets["client_id"].isNullOrBlank() ||
-            secrets["password"].isNullOrBlank() || secrets["totp_secret"].isNullOrBlank()
-        ) return null
+        val accounts = failover.angelOneAccounts(secrets)
+        if (accounts.isEmpty()) return null
+        val (candidates, pausedErr) = failover.selectOrderedAccounts("angel_one", accounts) { it.slot }
+        if (pausedErr != null || candidates.isEmpty()) return null
 
         val strikeNum = strike ?: 0.0
         val strikeClean = if (strikeNum == strikeNum.toLong().toDouble()) strikeNum.toLong().toString() else strikeNum.toString()
@@ -247,26 +250,46 @@ class VerificationService(
         queries += targetSymbol
         if (targetSymbol.length > 6) queries += targetSymbol.take(6)
 
-        var jwt = providers.authenticateAngelOne(secrets).first
         val rawHits = mutableListOf<JSONObject>()
-
-        for (exch in exchanges) {
-            for (q in queries) {
-                val hits = try {
-                    providers.searchAngelScrip(jwt, secrets["api_key"]!!, exch, q)
-                } catch (e: ProviderError) {
-                    val msg = e.message.orEmpty()
-                    if ("Invalid Token" in msg || "401" in msg || "AG8001" in msg) {
-                        jwt = providers.authenticateAngelOne(secrets, forceRefresh = true).first
-                        providers.searchAngelScrip(jwt, secrets["api_key"]!!, exch, q)
-                    } else {
-                        emptyList()
+        var accountIdx = 0
+        while (accountIdx < candidates.size && rawHits.isEmpty()) {
+            val acc = candidates[accountIdx]
+            val accSecrets = acc.toSecretsMap()
+            try {
+                var jwt = providers.authenticateAngelOne(accSecrets).first
+                for (exch in exchanges) {
+                    for (q in queries) {
+                        val hits = try {
+                            providers.searchAngelScrip(jwt, acc.apiKey, exch, q)
+                        } catch (e: ProviderError) {
+                            val msg = e.message.orEmpty()
+                            if ("Invalid Token" in msg || "401" in msg || "AG8001" in msg) {
+                                jwt = providers.authenticateAngelOne(accSecrets, forceRefresh = true).first
+                                providers.searchAngelScrip(jwt, acc.apiKey, exch, q)
+                            } else if (failover.shouldFailover(e.category, e.httpCode)) {
+                                throw e
+                            } else {
+                                emptyList()
+                            }
+                        }
+                        if (hits.isNotEmpty()) {
+                            rawHits.addAll(hits)
+                            break
+                        }
                     }
                 }
-                if (hits.isNotEmpty()) {
-                    rawHits.addAll(hits)
+                failover.recordSlotSuccess("angel_one", acc.slot)
+                break
+            } catch (e: ProviderError) {
+                failover.recordSlotFailure("angel_one", acc.slot, e.category, e.httpCode, e.message)
+                if (accountIdx + 1 < candidates.size && failover.shouldFailover(e.category, e.httpCode)) {
+                    logFailoverEvent("angel_one", acc.slot, candidates[accountIdx + 1].slot, e.category, e.message)
+                    accountIdx++
+                } else {
                     break
                 }
+            } catch (_: Exception) {
+                break
             }
         }
         if (rawHits.isEmpty()) return null
@@ -507,6 +530,143 @@ class VerificationService(
         }
     }
 
+    private suspend fun logFailoverEvent(
+        provider: String,
+        fromSlot: String,
+        toSlot: String,
+        category: String,
+        reason: String?
+    ) {
+        val now = TimeUtils.utcNowIso()
+        val safeReason = ProviderErrorClassifier.sanitize(reason).ifBlank { category }
+        db.coreDao().insertSystemLog(
+            SystemLogEntity(
+                createdAt = now,
+                severity = "WARNING",
+                source = provider,
+                message = "Auto-failover ($fromSlot -> $toSlot) triggered after $category: $safeReason"
+            )
+        )
+        eventBus.emit(AppEvent("api.health.changed", null, "failover", "$provider switched $fromSlot -> $toSlot", now))
+    }
+
+    suspend fun fetchTwelveDataWithFailover(
+        tdSym: String,
+        interval: String,
+        start: Instant?,
+        end: Instant?,
+        configMap: Map<String, Any?>
+    ): Triple<List<Candle>, Double, String> {
+        val secrets = secretStore.getProviderSecrets("twelve_data")
+        val accounts = failover.twelveDataAccounts(secrets)
+        if (accounts.isEmpty()) {
+            recordApiCall("twelve_data", "/time_series", "error", null, "auth_error", 0.0, 0, "Twelve Data API key is not configured.", tdSym)
+            throw ProviderError("Twelve Data API key is not configured.", null, "auth_error")
+        }
+        val (candidates, pausedErr) = failover.selectOrderedAccounts("twelve_data", accounts) { it.slot }
+        if (pausedErr != null || candidates.isEmpty()) {
+            throw pausedErr ?: ProviderError("Twelve Data accounts temporarily paused.", 429, "rate_limited")
+        }
+
+        var lastErr: ProviderError? = null
+        for (i in candidates.indices) {
+            val acc = candidates[i]
+            val reqTag = "$tdSym [${acc.slot}]"
+            try {
+                val (fetched, credits) = providers.fetchTwelveDataCandles(tdSym, interval, start, end, configMap, acc.apiKey)
+                failover.recordSlotSuccess("twelve_data", acc.slot)
+                recordApiCall("twelve_data", "/time_series", "success", 200, "ok", credits, fetched.size, null, reqTag)
+                return Triple(fetched, credits, acc.slot)
+            } catch (e: ProviderError) {
+                recordApiCall("twelve_data", "/time_series", "error", e.httpCode, e.category, 0.0, 0, "[${acc.slot}] ${e.message}", reqTag)
+                failover.recordSlotFailure("twelve_data", acc.slot, e.category, e.httpCode, e.message)
+                lastErr = e
+                if (i + 1 < candidates.size && failover.shouldFailover(e.category, e.httpCode)) {
+                    logFailoverEvent("twelve_data", acc.slot, candidates[i + 1].slot, e.category, e.message)
+                    continue
+                }
+                throw e
+            } catch (e: Exception) {
+                val cat = ProviderErrorClassifier.classify(null, e.message, e is java.io.IOException)
+                recordApiCall("twelve_data", "/time_series", "error", null, cat, 0.0, 0, "[${acc.slot}] ${e.message}", reqTag)
+                failover.recordSlotFailure("twelve_data", acc.slot, cat, null, e.message)
+                val pe = ProviderError(e.message ?: "Twelve Data fetch failed", null, cat)
+                lastErr = pe
+                if (i + 1 < candidates.size && failover.shouldFailover(cat, null)) {
+                    logFailoverEvent("twelve_data", acc.slot, candidates[i + 1].slot, cat, e.message)
+                    continue
+                }
+                throw pe
+            }
+        }
+        throw lastErr ?: ProviderError("Twelve Data fetch failed across all accounts.", null, "provider_error")
+    }
+
+    suspend fun fetchAngelCandlesWithFailover(
+        exchange: String,
+        token: String,
+        interval: String,
+        fromStr: String,
+        toStr: String,
+        requestKey: String = "$exchange:$token"
+    ): Pair<List<Candle>, String> {
+        val secrets = secretStore.getProviderSecrets("angel_one")
+        val accounts = failover.angelOneAccounts(secrets)
+        if (accounts.isEmpty()) {
+            recordApiCall("angel_one", "/historical/getCandleData", "error", null, "auth_error", 0.0, 0, "Angel One is not configured.", requestKey)
+            throw ProviderError("Angel One is not configured.", null, "auth_error")
+        }
+        val (candidates, pausedErr) = failover.selectOrderedAccounts("angel_one", accounts) { it.slot }
+        if (pausedErr != null || candidates.isEmpty()) {
+            throw pausedErr ?: ProviderError("Angel One accounts temporarily paused.", 429, "rate_limited")
+        }
+
+        var lastErr: ProviderError? = null
+        for (i in candidates.indices) {
+            val acc = candidates[i]
+            val accSecrets = acc.toSecretsMap()
+            val reqTag = "$requestKey [${acc.slot}]"
+            try {
+                var jwt = providers.authenticateAngelOne(accSecrets).first
+                val fetched = try {
+                    providers.fetchAngelCandles(jwt, acc.apiKey, exchange, token, interval, fromStr, toStr)
+                } catch (e: ProviderError) {
+                    val msg = e.message.orEmpty()
+                    if ("Invalid Token" in msg || "401" in msg || "AG8001" in msg) {
+                        jwt = providers.authenticateAngelOne(accSecrets, forceRefresh = true).first
+                        providers.fetchAngelCandles(jwt, acc.apiKey, exchange, token, interval, fromStr, toStr)
+                    } else {
+                        throw e
+                    }
+                }
+                failover.recordSlotSuccess("angel_one", acc.slot)
+                recordApiCall("angel_one", "/historical/getCandleData", "success", 200, "ok", 0.0, fetched.size, null, reqTag)
+                return fetched to acc.slot
+            } catch (e: ProviderError) {
+                recordApiCall("angel_one", "/historical/getCandleData", "error", e.httpCode, e.category, 0.0, 0, "[${acc.slot}] ${e.message}", reqTag)
+                failover.recordSlotFailure("angel_one", acc.slot, e.category, e.httpCode, e.message)
+                lastErr = e
+                if (i + 1 < candidates.size && failover.shouldFailover(e.category, e.httpCode)) {
+                    logFailoverEvent("angel_one", acc.slot, candidates[i + 1].slot, e.category, e.message)
+                    continue
+                }
+                throw e
+            } catch (e: Exception) {
+                val cat = ProviderErrorClassifier.classify(null, e.message, e is java.io.IOException)
+                recordApiCall("angel_one", "/historical/getCandleData", "error", null, cat, 0.0, 0, "[${acc.slot}] ${e.message}", reqTag)
+                failover.recordSlotFailure("angel_one", acc.slot, cat, null, e.message)
+                val pe = ProviderError(e.message ?: "Angel One fetch failed", null, cat)
+                lastErr = pe
+                if (i + 1 < candidates.size && failover.shouldFailover(cat, null)) {
+                    logFailoverEvent("angel_one", acc.slot, candidates[i + 1].slot, cat, e.message)
+                    continue
+                }
+                throw pe
+            }
+        }
+        throw lastErr ?: ProviderError("Angel One fetch failed across all accounts.", null, "provider_error")
+    }
+
     private suspend fun fetchProviderRange(
         provider: String,
         resolvedSym: String,
@@ -518,7 +678,6 @@ class VerificationService(
         if (!fetchEnd.isAfter(fetchStart.plusSeconds(30))) return 0
         val integration = db.coreDao().getIntegration(provider)
         val configMap = integration?.let { jsonObjectToMap(it.configJson) } ?: emptyMap()
-        val secrets = secretStore.getProviderSecrets(provider)
 
         val candles: List<Candle> = when (provider) {
             "binance" -> {
@@ -536,26 +695,11 @@ class VerificationService(
                 }
             }
             "twelve_data" -> {
-                val apiKey = secrets["api_key"].orEmpty()
-                if (integration == null || apiKey.isBlank()) {
-                    recordApiCall("twelve_data", "/time_series", "error", null, "auth_error", 0.0, 0, "Twelve Data API key is not configured.", cacheSym)
-                    throw ProviderError("Twelve Data API key is not configured.", null, "auth_error")
-                }
                 val tdSym = if (Regex("^[A-Z]{6}$").matches(cacheSym)) {
                     "${cacheSym.substring(0, 3)}/${cacheSym.substring(3)}"
                 } else cacheSym
-                try {
-                    val (fetched, credits) = providers.fetchTwelveDataCandles(tdSym, "1min", fetchStart, fetchEnd, configMap, apiKey)
-                    recordApiCall("twelve_data", "/time_series", "success", 200, "ok", credits, fetched.size, null, tdSym)
-                    fetched.map { it.copy(symbol = cacheSym) }
-                } catch (e: ProviderError) {
-                    recordApiCall("twelve_data", "/time_series", "error", e.httpCode, e.category, 0.0, 0, e.message, tdSym)
-                    throw e
-                } catch (e: Exception) {
-                    val cat = ProviderErrorClassifier.classify(null, e.message, e is java.io.IOException)
-                    recordApiCall("twelve_data", "/time_series", "error", null, cat, 0.0, 0, e.message, tdSym)
-                    throw ProviderError(e.message ?: "Twelve Data fetch failed", null, cat)
-                }
+                val (fetched, _, _) = fetchTwelveDataWithFailover(tdSym, "1min", fetchStart, fetchEnd, configMap)
+                fetched.map { it.copy(symbol = cacheSym) }
             }
             else -> {
                 if (":" !in resolvedSym) {
@@ -568,36 +712,10 @@ class VerificationService(
                     recordApiCall("angel_one", "/historical/getCandleData", "error", null, "provider_error", 0.0, 0, errMsg, resolvedSym)
                     throw ProviderError(errMsg)
                 }
-                if (integration == null || secrets["api_key"].isNullOrBlank()) {
-                    recordApiCall("angel_one", "/historical/getCandleData", "error", null, "auth_error", 0.0, 0, "Angel One is not configured.", resolvedSym)
-                    throw ProviderError("Angel One is not configured.", null, "auth_error")
-                }
                 val (exchange, token) = resolvedSym.split(":", limit = 2)
-                try {
-                    var jwt = providers.authenticateAngelOne(secrets).first
-                    val fromStr = angelDateFmt.format(fetchStart)
-                    val toStr = angelDateFmt.format(fetchEnd)
-                    val fetched = try {
-                        providers.fetchAngelCandles(jwt, secrets["api_key"]!!, exchange, token, "ONE_MINUTE", fromStr, toStr)
-                    } catch (e: ProviderError) {
-                        val msg = e.message.orEmpty()
-                        if ("Invalid Token" in msg || "401" in msg || "AG8001" in msg) {
-                            jwt = providers.authenticateAngelOne(secrets, forceRefresh = true).first
-                            providers.fetchAngelCandles(jwt, secrets["api_key"]!!, exchange, token, "ONE_MINUTE", fromStr, toStr)
-                        } else {
-                            throw e
-                        }
-                    }
-                    recordApiCall("angel_one", "/historical/getCandleData", "success", 200, "ok", 0.0, fetched.size, null, resolvedSym)
-                    fetched
-                } catch (e: ProviderError) {
-                    recordApiCall("angel_one", "/historical/getCandleData", "error", e.httpCode, e.category, 0.0, 0, e.message, resolvedSym)
-                    throw e
-                } catch (e: Exception) {
-                    val cat = ProviderErrorClassifier.classify(null, e.message, e is java.io.IOException)
-                    recordApiCall("angel_one", "/historical/getCandleData", "error", null, cat, 0.0, 0, e.message, resolvedSym)
-                    throw ProviderError(e.message ?: "Angel One fetch failed", null, cat)
-                }
+                val fromStr = angelDateFmt.format(fetchStart)
+                val toStr = angelDateFmt.format(fetchEnd)
+                fetchAngelCandlesWithFailover(exchange, token, "ONE_MINUTE", fromStr, toStr, resolvedSym).first
             }
         }
         storeCandles(candles)
@@ -617,16 +735,25 @@ class VerificationService(
         val maxDt = TimeUtils.parseUtcInstant(bounds?.maxTs)
 
         if (minDt == null || maxDt == null) {
-            return fetchProviderRange(provider, resolvedSym, cacheSym, desiredStart, end, item)
+            val fetched = fetchProviderRange(provider, resolvedSym, cacheSym, desiredStart, end, item)
+            if (fetched > 0) failover.clearEmptyForwardFetch(provider, cacheSym)
+            return fetched
         }
 
         var fetchedTotal = 0
         if (desiredStart.isBefore(minDt)) {
             fetchedTotal += fetchProviderRange(provider, resolvedSym, cacheSym, desiredStart, minDt, item)
         }
-        if (end.isAfter(maxDt.plusSeconds(30))) {
+        if (end.isAfter(maxDt.plusSeconds(30)) && !failover.isForwardFetchCooledDown(provider, cacheSym)) {
             val forwardStart = if (desiredStart.isAfter(maxDt)) desiredStart else maxDt
-            fetchedTotal += fetchProviderRange(provider, resolvedSym, cacheSym, forwardStart, end, item)
+            val forwardFetched = fetchProviderRange(provider, resolvedSym, cacheSym, forwardStart, end, item)
+            fetchedTotal += forwardFetched
+            if (forwardFetched == 0) {
+                // Market likely closed / no new candle formed yet — avoid burning credits every tick
+                failover.markEmptyForwardFetch(provider, cacheSym)
+            } else {
+                failover.clearEmptyForwardFetch(provider, cacheSym)
+            }
         }
         return fetchedTotal
     }

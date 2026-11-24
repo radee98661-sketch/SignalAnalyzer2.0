@@ -199,29 +199,49 @@
       <output id="binance-result"></output>
     </article>
     <article>
-      <h2>Twelve Data — Forex</h2>
-      <p class="muted">Forex &amp; commodities historical candles (e.g. XAU/USD, WTI/USD) and local cache.</p>
+      <div class="toolbar" style="margin-bottom:4px">
+        <h2>Twelve Data — Forex</h2>
+        <span id="twelve-backup-badge" class="pill badge-muted">1 KEY</span>
+      </div>
+      <p class="muted">Forex &amp; commodities historical candles (e.g. XAU/USD, WTI/USD) with automatic failover to Backup API key when Primary hits rate/daily limits.</p>
       <form id="twelve-form" class="form-grid">
-        <label>API key<input name="api_key" type="password" placeholder="Leave empty to keep saved key"></label>
+        <label>Primary API key<input name="api_key" type="password" placeholder="Leave empty to keep saved primary key"></label>
+        <label>Secondary / Backup API key (Auto-Failover)<input name="backup_api_key" type="password" placeholder="Optional 2nd account key — used if Primary hits limit"></label>
         <label>Base URL<input name="base_url" value="https://api.twelvedata.com"></label>
         <label>Default symbols<input name="symbols" value="XAU/USD, WTI/USD, EUR/USD, GBP/USD, USD/JPY"></label>
         <label>Timezone<input name="timezone" value="UTC"></label>
         <button class="primary">Save Twelve Data</button>
       </form>
+      <div class="actions">
+        <button id="twelve-test-primary" type="button">Test Primary Key</button>
+        <button id="twelve-test-backup" type="button">Test Backup Key</button>
+        <button id="twelve-clear-backup" type="button" class="btn-danger">Clear Backup</button>
+      </div>
       <output id="twelve-result"></output>
     </article>
     <article>
-      <h2>Angel One SmartAPI</h2>
-      <p class="muted">Authentication, official instrument master, token lookup, Indian options and MCX candle retrieval.</p>
+      <div class="toolbar" style="margin-bottom:4px">
+        <h2>Angel One SmartAPI</h2>
+        <span id="angel-backup-badge" class="pill badge-muted">PRIMARY ONLY</span>
+      </div>
+      <p class="muted">Authentication, official instrument master, Indian F&amp;O &amp; MCX candles with automatic failover to a Backup account if Primary fails or hits rate limits.</p>
       <form id="angel-form" class="form-grid">
-        <label>API key<input name="api_key" type="password" placeholder="Encrypted in Android Keystore"></label>
-        <label>Client ID<input name="client_id" type="password"></label>
-        <label>Password / PIN<input name="password" type="password"></label>
-        <label>TOTP secret<input name="totp_secret" type="password"></label>
+        <div class="backup-subhead">Primary Account</div>
+        <label>Primary API key<input name="api_key" type="password" placeholder="Encrypted in Android Keystore"></label>
+        <label>Primary Client ID<input name="client_id" type="password" placeholder="Leave empty to keep saved"></label>
+        <label>Primary Password / PIN<input name="password" type="password" placeholder="Leave empty to keep saved"></label>
+        <label>Primary TOTP secret<input name="totp_secret" type="password" placeholder="Leave empty to keep saved"></label>
+        <div class="backup-subhead backup-accent">Secondary / Backup Account (Auto-Failover)</div>
+        <label>Backup API key<input name="backup_api_key" type="password" placeholder="Optional 2nd Angel One account API key"></label>
+        <label>Backup Client ID<input name="backup_client_id" type="password" placeholder="Optional 2nd account Client ID"></label>
+        <label>Backup Password / PIN<input name="backup_password" type="password" placeholder="Optional 2nd account Password / PIN"></label>
+        <label>Backup TOTP secret<input name="backup_totp_secret" type="password" placeholder="Optional 2nd account Base32 TOTP secret"></label>
         <button class="primary">Save Angel One credentials</button>
       </form>
       <div class="actions">
-        <button id="angel-test" type="button">Authenticate / test session</button>
+        <button id="angel-test" type="button">Test Primary Login</button>
+        <button id="angel-test-backup" type="button">Test Backup Login</button>
+        <button id="angel-clear-backup" type="button" class="btn-danger">Clear Backup</button>
         <button id="master-refresh" type="button">Refresh official instrument master</button>
       </div>
       <output id="angel-result"></output>

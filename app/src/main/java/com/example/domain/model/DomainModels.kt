@@ -178,7 +178,10 @@ data class ApiProviderHealth(
     val lastErrorAt: String? = null,
     val lastErrorCategory: String? = null,
     val lastHttpCode: Int? = null,
-    val lastErrorMessage: String? = null
+    val lastErrorMessage: String? = null,
+    val backupConfigured: Boolean = false,
+    val activeSlot: String = "primary", // "primary", "backup", "exhausted", "unconfigured"
+    val failoverNote: String? = null
 )
 
 data class ApiHealthAlert(

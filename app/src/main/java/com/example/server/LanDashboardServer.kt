@@ -853,14 +853,31 @@ class LanDashboardServer(
             val sk = secretsObj.keys()
             while (sk.hasNext()) {
                 val k = sk.next()
-                val v = secretsObj.optString(k, "")
+                val v = secretsObj.optString(k, "").trim()
                 if (v.isNotEmpty()) secretsMap[k] = v
             }
-            repository.saveIntegration(provider, configObj.toString(), secretsMap)
+            val removeKeys = if (body.optBoolean("clear_backup", false)) {
+                when (provider) {
+                    "twelve_data" -> com.example.data.repository.ProviderFailoverManager.TWELVE_DATA_BACKUP_KEYS
+                    "angel_one" -> com.example.data.repository.ProviderFailoverManager.ANGEL_ONE_BACKUP_KEYS
+                    else -> emptyList()
+                }
+            } else emptyList()
+            repository.saveIntegration(provider, configObj.toString(), secretsMap, removeKeys)
             call.respondJson(JSONObject().put("ok", true).put("status", "saved").put("provider", provider))
         }
         post("/integrations/{provider}") { handleSaveIntegration(call) }
         put("/integrations/{provider}") { handleSaveIntegration(call) }
+
+        delete("/integrations/{provider}/backup") {
+            if (!call.requireAuth()) return@delete
+            val provider = call.parameters["provider"].orEmpty().trim()
+            if (provider !in setOf("twelve_data", "angel_one")) {
+                return@delete call.respondJsonError(HttpStatusCode.BadRequest, "Backup credentials are only supported for twelve_data and angel_one.")
+            }
+            repository.clearBackupCredentials(provider)
+            call.respondJson(JSONObject().put("ok", true).put("status", "backup_cleared").put("provider", provider))
+        }
 
         delete("/integrations/{provider}") {
             if (!call.requireAuth()) return@delete
@@ -951,6 +968,25 @@ class LanDashboardServer(
             }
         }
 
+        post("/twelve-data/test") {
+            if (!call.requireAuth()) return@post
+            val body = call.readJsonBody() ?: JSONObject()
+            val slot = body.optString("slot", "primary").trim()
+            try {
+                val (candles, credits, usedSlot) = repository.testTwelveData(slot)
+                call.respondJson(JSONObject().apply {
+                    put("ok", true)
+                    put("status", "connected")
+                    put("slot", usedSlot)
+                    put("candles", candles)
+                    put("credits_used", credits)
+                    put("detail", "Twelve Data ($usedSlot) responded with $candles candle(s).")
+                })
+            } catch (e: ProviderError) {
+                call.respondJsonError(HttpStatusCode.BadGateway, e.message ?: "Twelve Data error")
+            }
+        }
+
         get("/twelve-data/usage") {
             if (!call.requireAuth()) return@get
             val usage = repository.getTwelveDataUsage()
@@ -961,9 +997,17 @@ class LanDashboardServer(
 
         post("/angel-one/test") {
             if (!call.requireAuth()) return@post
+            val body = call.readJsonBody() ?: JSONObject()
+            val slot = body.optString("slot", "primary").trim()
             try {
-                val authAt = repository.testAngelOne()
-                call.respondJson(JSONObject().put("ok", true).put("status", "connected").put("authenticated_at", authAt))
+                val authAt = repository.testAngelOne(slot)
+                val usedSlot = if (slot.equals("backup", ignoreCase = true)) "backup" else "primary"
+                call.respondJson(JSONObject().apply {
+                    put("ok", true)
+                    put("status", "connected")
+                    put("slot", usedSlot)
+                    put("authenticated_at", authAt)
+                })
             } catch (e: ProviderError) {
                 call.respondJsonError(HttpStatusCode.BadGateway, e.message ?: "Angel One auth error")
             }
@@ -1162,6 +1206,9 @@ class LanDashboardServer(
                             put("last_error_category", p.lastErrorCategory ?: JSONObject.NULL)
                             put("last_http_code", p.lastHttpCode ?: JSONObject.NULL)
                             put("last_error_message", p.lastErrorMessage ?: JSONObject.NULL)
+                            put("backup_configured", p.backupConfigured)
+                            put("active_slot", p.activeSlot)
+                            put("failover_note", p.failoverNote ?: JSONObject.NULL)
                         }
                     }))
                     put("twelve_data_usage", usageObj)
@@ -1351,6 +1398,17 @@ class LanDashboardServer(
 
     private fun integrationToJson(entity: IntegrationEntity): JSONObject {
         val secretFields = repository.secretStore.getProviderSecretFieldNames(entity.provider)
+        val fieldSet = secretFields.toSet()
+        val hasPrimary = when (entity.provider) {
+            "twelve_data" -> "api_key" in fieldSet
+            "angel_one" -> listOf("api_key", "client_id", "password", "totp_secret").all { it in fieldSet }
+            else -> fieldSet.isNotEmpty()
+        }
+        val hasBackup = when (entity.provider) {
+            "twelve_data" -> "backup_api_key" in fieldSet
+            "angel_one" -> listOf("backup_api_key", "backup_client_id", "backup_password", "backup_totp_secret").all { it in fieldSet }
+            else -> false
+        }
         val cfgObj = try {
             JSONObject(entity.configJson)
         } catch (_: Exception) {
@@ -1363,6 +1421,9 @@ class LanDashboardServer(
             put("updated_at", entity.updatedAt)
             put("secret_fields", JSONArray(secretFields))
             put("has_secrets", secretFields.isNotEmpty())
+            put("has_primary_secrets", hasPrimary)
+            put("has_backup_secrets", hasBackup)
+            put("backup_configured", hasBackup)
         }
     }
 

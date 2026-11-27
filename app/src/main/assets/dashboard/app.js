@@ -5,7 +5,13 @@ let authSessionToken = '';
 let eventSocket = null;
 let wsReconnectTimer = null;
 let wsRefreshTimer = null;
+let wsHealthTimer = null;
 let currentView = 'overview';
+const pendingWsBatch = {
+  types: new Set(),
+  signalIds: new Set(),
+  cacheKeys: new Set(),
+};
 
 function showAuthModal(errMsg = '') {
   const overlay = $('#lan-auth-overlay');
@@ -49,6 +55,11 @@ const esc = x => String(x ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '
 
 function disconnectWebSocket() {
   if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+  if (wsRefreshTimer) { clearTimeout(wsRefreshTimer); wsRefreshTimer = null; }
+  if (wsHealthTimer) { clearTimeout(wsHealthTimer); wsHealthTimer = null; }
+  pendingWsBatch.types.clear();
+  pendingWsBatch.signalIds.clear();
+  pendingWsBatch.cacheKeys.clear();
   if (eventSocket) {
     try { eventSocket.close(); } catch (_) {}
     eventSocket = null;
@@ -76,15 +87,39 @@ function connectWebSocket() {
         showAuthModal('WebSocket authorization failed.');
         return;
       }
-      // Coalesce rapid updates into a single refresh of the active view
-      if (['signal.changed', 'sync.completed', 'schedule.changed', 'market.cache.changed', 'api.health.changed'].includes(msg.type)) {
+      // API health updates should NEVER force a Signals list/chart refresh
+      if (msg.type === 'api.health.changed') {
+        clearTimeout(wsHealthTimer);
+        wsHealthTimer = setTimeout(() => {
+          loadApiHealth().catch(() => {});
+          if (currentView === 'logs') loadLogs().catch(() => {});
+        }, 500);
+        return;
+      }
+      // Coalesce data events and preserve which signal IDs / cache keys changed
+      if (['signal.changed', 'sync.completed', 'schedule.changed', 'market.cache.changed'].includes(msg.type)) {
+        pendingWsBatch.types.add(msg.type);
+        if (msg.entity_id != null && !isNaN(Number(msg.entity_id))) {
+          pendingWsBatch.signalIds.add(Number(msg.entity_id));
+        }
+        if (msg.type === 'market.cache.changed' && msg.detail) {
+          pendingWsBatch.cacheKeys.add(String(msg.detail).trim().toUpperCase());
+        }
         clearTimeout(wsRefreshTimer);
         wsRefreshTimer = setTimeout(() => {
+          const batch = {
+            types: new Set(pendingWsBatch.types),
+            signalIds: new Set(pendingWsBatch.signalIds),
+            cacheKeys: new Set(pendingWsBatch.cacheKeys),
+          };
+          pendingWsBatch.types.clear();
+          pendingWsBatch.signalIds.clear();
+          pendingWsBatch.cacheKeys.clear();
           loadApiHealth().catch(() => {});
           if (!$('#review-drawer-backdrop')?.classList.contains('open')) {
-            refreshActiveView();
+            refreshActiveView(batch);
           }
-        }, 400);
+        }, 600);
       }
     } catch (_) {}
   };
@@ -96,11 +131,11 @@ function connectWebSocket() {
   };
 }
 
-function refreshActiveView() {
+function refreshActiveView(wsBatch = null) {
   if (!authSessionToken) return;
   if (currentView === 'overview') overview().catch(() => {});
   else if (currentView === 'inbox') refreshInboxView().catch(() => {});
-  else if (currentView === 'signals') loadSignals().catch(() => {});
+  else if (currentView === 'signals') loadSignals({ fromWs: Boolean(wsBatch), wsBatch }).catch(() => {});
   else if (currentView === 'notifications') notificationLog().catch(() => {});
   else if (currentView === 'market') { loadApiHealth().catch(() => {}); coverage().catch(() => {}); }
   else if (currentView === 'analytics') loadAnalytics().catch(() => {});
@@ -166,6 +201,13 @@ let af = { category: '', channel: '', date_from: '', date_to: '', pnl_basis: 'tp
 let selectedSignals = new Set();
 let expandedSignals = new Set();
 let chartCache = new Map();
+const chartInstances = new Map(); // signalId -> CandlestickChartController
+const chartInFlight = new Map();  // signalId -> Promise
+const cardSignatures = new Map(); // signalId -> memoized structural signature (card DOM)
+const cardChartSignatures = new Map(); // signalId -> memoized chart-relevant signature (excludes age_minutes & pnl_basis)
+let lastSummarySignature = '';
+let lastFiltersSignature = '';
+let signalsLoadSeq = 0;
 let lastSignalsData = [];
 let lastSignalsSummary = null;
 let reviewQueueIds = [];
@@ -430,128 +472,429 @@ function buildTimelineHtml(r) {
     </div>`).join('')}</div>`;
 }
 
-function renderCandlestickChart(container, chartData, hoverOut, signalObj = null) {
+function computeChartSignature(chartData, signalObj = null) {
+  if (!chartData) return 'empty';
   const candles = chartData.candles || [];
-  if (!candles.length) {
-    const label = chartData.trading_symbol ? `${chartData.trading_symbol} (token ${chartData.resolved_symbol})` : (chartData.resolved_symbol || chartData.symbol || '');
-    const reasonHtml = chartData.detail ? `<div style="margin-top:6px;color:#ffbb66">${esc(chartData.detail)}</div>` : '';
-    container.innerHTML = `<div class="chart-empty">No cached 1m candles yet for <b>${esc(label)}</b> (${esc(chartData.provider)}).${reasonHtml}</div>`;
-    return;
-  }
-  const fsHeaderHtml = signalObj ? `
-    <div class="chart-fs-header">
-      <div class="chart-fs-top">
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-          <strong style="font-size:16px;color:#fff">${esc(signalObj.symbol || chartData.trading_symbol || chartData.resolved_symbol)}</strong>
-          ${signalObj.direction ? `<span class="dir-pill ${signalObj.direction === 'BUY' ? 'dir-buy' : 'dir-sell'}">${esc(signalObj.direction)}</span>` : ''}
-          ${statusBadge(signalObj.verification_status, signalObj.is_manual_needed, signalObj.is_auto_scheduled, signalObj.closed_by_sl_after_tp, signalObj.max_tp_hit)}
-        </div>
-        <span class="muted" style="font-size:11px">Scroll to zoom &bull; Drag to pan &bull; Double-click to reset &bull; Esc to exit</span>
+  const first = candles[0];
+  const last = candles[candles.length - 1];
+  const mid = candles[candles.length >> 1];
+  const cSig = candles.length
+    ? `${candles.length}|${first.candle_timestamp}:${first.open},${first.high},${first.low},${first.close}|${mid?.candle_timestamp}:${mid?.close}|${last.candle_timestamp}:${last.open},${last.high},${last.low},${last.close}`
+    : `0|${chartData.detail || ''}`;
+  const evSig = (chartData.events || [])
+    .map(e => `${e.type || ''}:${e.candle_time || ''}:${e.price ?? ''}:${e.label || ''}:${e.leg ?? ''}`)
+    .join(';');
+  const lvlSig = `${chartData.entry_price ?? ''}|${(chartData.additional_entries || []).join(',')}|${chartData.stop_loss ?? ''}|${(chartData.targets || []).join(',')}|${chartData.direction || ''}|${chartData.notification_time || ''}`;
+  const metaSig = `${chartData.provider || ''}|${chartData.trading_symbol || ''}|${chartData.resolved_symbol || ''}`;
+  const hdrSig = signalObj
+    ? `${signalObj.symbol || ''}|${signalObj.direction || ''}|${signalObj.verification_status || ''}|${signalObj.max_tp_hit || 0}|${signalObj.closed_by_sl_after_tp ? 1 : 0}|${signalObj.is_manual_needed ? 1 : 0}|${signalObj.is_auto_scheduled ? 1 : 0}|${signalObj.trades_count || 0}`
+    : '';
+  return `${metaSig}#${lvlSig}#${cSig}#${evSig}#${hdrSig}`;
+}
+
+function buildFsHeaderInnerHtml(chartData, signalObj) {
+  if (!signalObj) return '';
+  return `
+    <div class="chart-fs-top">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <strong style="font-size:16px;color:#fff">${esc(signalObj.symbol || chartData.trading_symbol || chartData.resolved_symbol)}</strong>
+        ${signalObj.direction ? `<span class="dir-pill ${signalObj.direction === 'BUY' ? 'dir-buy' : 'dir-sell'}">${esc(signalObj.direction)}</span>` : ''}
+        ${statusBadge(signalObj.verification_status, signalObj.is_manual_needed, signalObj.is_auto_scheduled, signalObj.closed_by_sl_after_tp, signalObj.max_tp_hit)}
       </div>
-      ${buildSignalLadderHtml(signalObj, true)}
-    </div>` : '';
-  container.innerHTML = `
-    ${fsHeaderHtml}
-    <div class="chart-toolbar">
-      <div class="chart-btn-group">
-        <button type="button" class="ch-btn" data-act="zoom-in">+</button>
-        <button type="button" class="ch-btn" data-act="zoom-out">&minus;</button>
-        <button type="button" class="ch-btn" data-act="focus">Focus Trade</button>
-        <button type="button" class="ch-btn" data-act="fit">Fit All</button>
-      </div>
-      <button type="button" class="ch-btn" data-act="fullscreen">&#x26F6; Full Screen</button>
+      <span class="muted" style="font-size:11px">Scroll to zoom &bull; Drag to pan &bull; Double-click to reset &bull; Esc to exit</span>
     </div>
-    <div class="chart-fs-readout" style="display:none;font-size:11px;color:#9fb0cf;padding:2px 4px;"></div>
-    <div class="chart-canvas-holder" style="flex:1;min-height:0;width:100%;">
-      <canvas class="ohlc-canvas"></canvas>
-      <div class="chart-hud"></div>
-    </div>`;
-  const toolbar = container.querySelector('.chart-toolbar');
-  const fsHeader = container.querySelector('.chart-fs-header');
-  const fsReadout = container.querySelector('.chart-fs-readout');
-  const fsBtn = container.querySelector('[data-act="fullscreen"]');
-  const holder = container.querySelector('.chart-canvas-holder');
-  const hud = container.querySelector('.chart-hud');
-  const canvas = container.querySelector('canvas');
-  const ctx = canvas.getContext('2d');
-  const placeholder = document.createComment('chart-placeholder');
-  const candleTimesMs = candles.map(c => new Date(c.candle_timestamp).getTime());
-  function nearestIdx(iso) {
-    if (!iso) return -1;
+    ${buildSignalLadderHtml(signalObj, true)}`;
+}
+
+class CandlestickChartController {
+  constructor(signalId, container, hoverOut) {
+    this.signalId = signalId;
+    this.container = container;
+    this.hoverOut = hoverOut;
+    this.placeholder = document.createComment(`chart-placeholder-${signalId}`);
+    this.chartData = null;
+    this.signalObj = null;
+    this.candles = [];
+    this.candleTimesMs = [];
+    this.markers = [];
+    this.markersByIdx = new Map();
+    this.lastSignature = null;
+    this.lastFsHeaderSig = null;
+    this.hasInitializedViewport = false;
+    this.mounted = false;
+    this.destroyed = false;
+
+    this.viewStart = 0;
+    this.visibleCount = 1;
+    this.minVisible = 1;
+    this.maxVisible = 1;
+    this.activeIdx = -1;
+    this.includeAllLevelsInScale = false;
+    this.mouseDown = false;
+    this.dragStartX = 0;
+    this.dragStartView = 0;
+    this.rafId = 0;
+    this.resizeObserver = null;
+
+    // Stable bound listener references so destroy() cleans up with zero leaks
+    this._onWindowMouseMove = e => {
+      if (!this.mouseDown || this.destroyed || !this.canvas) return;
+      this.includeAllLevelsInScale = false;
+      this.viewStart = this.dragStartView - ((e.clientX - this.dragStartX) / Math.max(this.canvas.clientWidth - 82, 40)) * this.visibleCount;
+      this.clampViewport();
+      this.scheduleDraw();
+    };
+    this._onWindowMouseUp = () => { this.mouseDown = false; };
+    this._onWindowResize = () => { if (!this.destroyed && this.mounted) this.scheduleDraw(); };
+  }
+
+  _ensureShell() {
+    if (this.mounted) return;
+    this.container.innerHTML = `
+      <div class="chart-fs-header" style="display:none"></div>
+      <div class="chart-toolbar">
+        <div class="chart-btn-group">
+          <button type="button" class="ch-btn" data-act="zoom-in">+</button>
+          <button type="button" class="ch-btn" data-act="zoom-out">&minus;</button>
+          <button type="button" class="ch-btn" data-act="focus">Focus Trade</button>
+          <button type="button" class="ch-btn" data-act="fit">Fit All</button>
+        </div>
+        <div class="chart-toolbar-right">
+          <span class="chart-inline-status"></span>
+          <button type="button" class="ch-btn" data-act="fullscreen">&#x26F6; Full Screen</button>
+        </div>
+      </div>
+      <div class="chart-fs-readout" style="display:none;font-size:11px;color:#9fb0cf;padding:2px 4px;"></div>
+      <div class="chart-empty" style="display:none"></div>
+      <div class="chart-canvas-holder" style="flex:1;min-height:0;width:100%;">
+        <canvas class="ohlc-canvas"></canvas>
+        <div class="chart-hud"></div>
+      </div>`;
+
+    this.toolbar = this.container.querySelector('.chart-toolbar');
+    this.fsHeader = this.container.querySelector('.chart-fs-header');
+    this.fsReadout = this.container.querySelector('.chart-fs-readout');
+    this.fsBtn = this.container.querySelector('[data-act="fullscreen"]');
+    this.inlineStatus = this.container.querySelector('.chart-inline-status');
+    this.emptyBox = this.container.querySelector('.chart-empty');
+    this.holder = this.container.querySelector('.chart-canvas-holder');
+    this.hud = this.container.querySelector('.chart-hud');
+    this.canvas = this.container.querySelector('canvas');
+    this.ctx = this.canvas.getContext('2d');
+
+    this.container._exitFullscreen = () => this.toggleFullscreen(true);
+    this.container.querySelectorAll('.ch-btn').forEach(btn => {
+      btn.onclick = e => {
+        e.stopPropagation();
+        if (!this.candles.length && btn.dataset.act !== 'fullscreen') return;
+        const act = btn.dataset.act;
+        if (act === 'zoom-in') this.zoomBy(0.65);
+        else if (act === 'zoom-out') this.zoomBy(1.5);
+        else if (act === 'focus') { this.focusTradeRange(); this.scheduleDraw(); }
+        else if (act === 'fit') { this.fitAllRange(); this.scheduleDraw(); }
+        else if (act === 'fullscreen') this.toggleFullscreen(false);
+      };
+    });
+
+    this.canvas.addEventListener('mousedown', e => {
+      this.mouseDown = true;
+      this.dragStartX = e.clientX;
+      this.dragStartView = this.viewStart;
+    });
+    this.canvas.addEventListener('mousemove', e => {
+      if (this.mouseDown || !this.candles.length) return;
+      const nextIdx = this.clientXToCandleIdx(e.clientX);
+      if (nextIdx !== this.activeIdx) {
+        this.activeIdx = nextIdx;
+        this.scheduleDraw();
+      }
+    });
+    this.canvas.addEventListener('mouseleave', () => {
+      if (!this.mouseDown && this.activeIdx !== -1) {
+        this.activeIdx = -1;
+        this.scheduleDraw();
+      }
+    });
+    this.canvas.addEventListener('dblclick', () => {
+      if (!this.candles.length) return;
+      this.activeIdx = -1;
+      this.fitAllRange();
+      this.scheduleDraw();
+    });
+    this.canvas.addEventListener('wheel', e => {
+      if (!this.candles.length) return;
+      e.preventDefault();
+      const rect = this.canvas.getBoundingClientRect();
+      const plotW = Math.max(rect.width - 82, 40);
+      const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left - 10) / plotW));
+      this.zoomBy(e.deltaY > 0 ? 1.25 : 0.8, ratio);
+    }, { passive: false });
+
+    window.addEventListener('mousemove', this._onWindowMouseMove);
+    window.addEventListener('mouseup', this._onWindowMouseUp);
+    window.addEventListener('resize', this._onWindowResize);
+
+    if (typeof ResizeObserver !== 'undefined') {
+      this.resizeObserver = new ResizeObserver(() => {
+        if (!this.destroyed && this.mounted && this.candles.length) this.scheduleDraw();
+      });
+      this.resizeObserver.observe(this.holder);
+    }
+
+    this.mounted = true;
+  }
+
+  setLoading(isLoading, label = 'Updating...') {
+    if (this.destroyed) return;
+    if (!this.mounted) {
+      if (isLoading) {
+        this.container.innerHTML = '<p class="muted" style="padding:12px">Loading OHLC candles &amp; markers...</p>';
+      }
+      return;
+    }
+    if (this.inlineStatus) {
+      this.inlineStatus.textContent = label;
+      this.inlineStatus.classList.toggle('visible', Boolean(isLoading));
+    }
+  }
+
+  setError(message) {
+    if (this.destroyed) return;
+    if (!this.mounted || !this.candles.length) {
+      this.mounted = false;
+      this.lastSignature = null;
+      this.container.innerHTML = `<p class="red" style="padding:12px">Chart error: ${esc(message)}</p>`;
+    } else if (this.inlineStatus) {
+      this.inlineStatus.textContent = `Refresh failed: ${message}`;
+      this.inlineStatus.classList.add('visible');
+      setTimeout(() => { if (!this.destroyed && this.inlineStatus) this.inlineStatus.classList.remove('visible'); }, 4500);
+    }
+  }
+
+  _nearestIdx(iso) {
+    if (!iso || !this.candleTimesMs.length) return -1;
     const targetMs = new Date(iso).getTime();
     if (isNaN(targetMs)) return -1;
     let best = 0, bestDiff = Infinity;
-    for (let i = 0; i < candleTimesMs.length; i++) {
-      const diff = Math.abs(candleTimesMs[i] - targetMs);
+    for (let i = 0; i < this.candleTimesMs.length; i++) {
+      const diff = Math.abs(this.candleTimesMs[i] - targetMs);
       if (diff < bestDiff) { bestDiff = diff; best = i; }
     }
     return best;
   }
-  const markers = [], markersByIdx = new Map();
-  function addMarker(idx, label, color, price, detailText) {
-    if (idx < 0 || idx >= candles.length) return;
-    const item = { idx, label, color, price, detailText };
-    markers.push(item);
-    if (!markersByIdx.has(idx)) markersByIdx.set(idx, []);
-    markersByIdx.get(idx).push(item);
+
+  _rebuildDerivedSeries() {
+    this.candleTimesMs = this.candles.map(c => new Date(c.candle_timestamp).getTime());
+    this.markers = [];
+    this.markersByIdx = new Map();
+    const addMarker = (idx, label, color, price, detailText) => {
+      if (idx < 0 || idx >= this.candles.length) return;
+      const item = { idx, label, color, price, detailText };
+      this.markers.push(item);
+      if (!this.markersByIdx.has(idx)) this.markersByIdx.set(idx, []);
+      this.markersByIdx.get(idx).push(item);
+    };
+    const sigIdx = this._nearestIdx(this.chartData.notification_time);
+    if (sigIdx >= 0) {
+      addMarker(sigIdx, 'SIG', '#94a3bd', this.candles[sigIdx].close, `Signal Sent (${fmtDateTime(this.chartData.notification_time)})`);
+    }
+    for (const ev of (this.chartData.events || [])) {
+      const idx = this._nearestIdx(ev.candle_time);
+      if (idx < 0) continue;
+      const isTp = ev.type === 'tp_hit';
+      const isSlAfterTp = ev.type === 'sl_after_tp';
+      const isSl = ev.type === 'sl_hit' || ev.type === 'ambiguous';
+      const shortLbl = ev.type === 'entry_hit' ? (ev.leg ? `E${ev.leg}` : 'ENTRY') : isTp ? String(ev.label || 'TP').split(' ')[0] : isSlAfterTp ? 'SL*' : isSl ? 'SL' : ev.label;
+      const col = isTp ? '#62d6a5' : isSlAfterTp ? '#f59e0b' : isSl ? '#ff7285' : '#60a5fa';
+      addMarker(idx, shortLbl, col, ev.price ?? this.candles[idx].close, `${ev.label} @ ${ev.price ?? ''} (${fmtDateTime(ev.candle_time)})`);
+    }
   }
-  const sigIdx = nearestIdx(chartData.notification_time);
-  if (sigIdx >= 0) addMarker(sigIdx, 'SIG', '#94a3bd', candles[sigIdx].close, `Signal Sent (${fmtDateTime(chartData.notification_time)})`);
-  for (const ev of (chartData.events || [])) {
-    const idx = nearestIdx(ev.candle_time);
-    if (idx < 0) continue;
-    const isTp = ev.type === 'tp_hit';
-    const isSlAfterTp = ev.type === 'sl_after_tp';
-    const isSl = ev.type === 'sl_hit' || ev.type === 'ambiguous';
-    const shortLbl = ev.type === 'entry_hit' ? (ev.leg ? `E${ev.leg}` : 'ENTRY') : isTp ? String(ev.label || 'TP').split(' ')[0] : isSlAfterTp ? 'SL*' : isSl ? 'SL' : ev.label;
-    const col = isTp ? '#62d6a5' : isSlAfterTp ? '#f59e0b' : isSl ? '#ff7285' : '#60a5fa';
-    addMarker(idx, shortLbl, col, ev.price ?? candles[idx].close, `${ev.label} @ ${ev.price ?? ''} (${fmtDateTime(ev.candle_time)})`);
+
+  updateData(chartData, signalObj = null, { preserveViewport = true } = {}) {
+    if (this.destroyed || !chartData) return false;
+    const nextSig = computeChartSignature(chartData, signalObj);
+    if (this.mounted && nextSig === this.lastSignature) {
+      this.setLoading(false);
+      return false; // Memoized strict NO-OP: identical candles, markers, levels, and header
+    }
+
+    const oldCandles = this.candles;
+    const oldLen = oldCandles.length;
+    const prevHoverTs = (this.activeIdx >= 0 && this.activeIdx < oldLen) ? oldCandles[this.activeIdx].candle_timestamp : null;
+    const prevFirstTs = oldLen > 0 ? oldCandles[0].candle_timestamp : null;
+    const wasAtRightEdge = oldLen > 0 && (this.viewStart + this.visibleCount >= oldLen - 1.5);
+    const wasFitAll = oldLen > 0 && (this.visibleCount >= oldLen - 0.5);
+
+    this._ensureShell();
+    this.chartData = chartData;
+    this.signalObj = signalObj;
+    this.candles = chartData.candles || [];
+    this.lastSignature = nextSig;
+    this.setLoading(false);
+
+    // Update fullscreen header only if its content changed
+    const fsHeaderSig = signalObj
+      ? `${signalObj.symbol}|${signalObj.direction}|${signalObj.verification_status}|${signalObj.max_tp_hit}|${signalObj.closed_by_sl_after_tp}|${signalObj.is_manual_needed}|${signalObj.is_auto_scheduled}|${signalObj.stop_loss}|${signalObj.entry_price}|${(signalObj.targets || []).join(',')}`
+      : 'none';
+    if (fsHeaderSig !== this.lastFsHeaderSig) {
+      this.lastFsHeaderSig = fsHeaderSig;
+      if (signalObj) {
+        this.fsHeader.innerHTML = buildFsHeaderInnerHtml(chartData, signalObj);
+        this.fsHeader.style.display = '';
+      } else {
+        this.fsHeader.innerHTML = '';
+        this.fsHeader.style.display = 'none';
+      }
+    }
+
+    if (!this.candles.length) {
+      const label = chartData.trading_symbol ? `${chartData.trading_symbol} (token ${chartData.resolved_symbol})` : (chartData.resolved_symbol || chartData.symbol || '');
+      const reasonHtml = chartData.detail ? `<div style="margin-top:6px;color:#ffbb66">${esc(chartData.detail)}</div>` : '';
+      this.emptyBox.innerHTML = `No cached 1m candles yet for <b>${esc(label)}</b> (${esc(chartData.provider)}).${reasonHtml}`;
+      this.emptyBox.style.display = 'block';
+      this.holder.style.display = 'none';
+      if (this.hoverOut) this.hoverOut.textContent = `No cached 1m candles yet (${chartData.provider || ''})`;
+      return true;
+    }
+
+    this.emptyBox.style.display = 'none';
+    this.holder.style.display = '';
+
+    this._rebuildDerivedSeries();
+    this.minVisible = Math.min(8, this.candles.length);
+    this.maxVisible = Math.max(this.candles.length, this.minVisible);
+
+    if (!this.hasInitializedViewport || !preserveViewport || oldLen === 0) {
+      if (this.candles.length > 45) this.focusTradeRange(); else this.fitAllRange();
+      this.hasInitializedViewport = true;
+    } else {
+      // Shift viewStart if older bars were prepended on the left
+      let prepended = 0;
+      if (prevFirstTs) {
+        const idxOfOldFirst = this.candles.findIndex(c => c.candle_timestamp === prevFirstTs);
+        if (idxOfOldFirst > 0) prepended = idxOfOldFirst;
+      }
+      const addedTotal = this.candles.length - oldLen;
+      const addedRight = Math.max(0, addedTotal - prepended);
+
+      if (wasFitAll) {
+        this.viewStart = 0;
+        this.visibleCount = this.candles.length;
+      } else {
+        this.viewStart += prepended;
+        if (wasAtRightEdge && addedRight > 0) {
+          this.viewStart += addedRight;
+        }
+      }
+      this.clampViewport();
+
+      // Keep hover crosshair pinned to the exact same candle timestamp
+      if (prevHoverTs) {
+        const newHoverIdx = this.candles.findIndex(c => c.candle_timestamp === prevHoverTs);
+        this.activeIdx = newHoverIdx;
+      } else if (this.activeIdx >= this.candles.length) {
+        this.activeIdx = -1;
+      }
+    }
+
+    this.scheduleDraw();
+    return true;
   }
-  const minVisible = Math.min(8, candles.length), maxVisible = Math.max(candles.length, minVisible);
-  let viewStart = 0, visibleCount = candles.length, activeIdx = -1, includeAllLevelsInScale = false;
-  function clampViewport() {
-    visibleCount = Math.max(minVisible, Math.min(maxVisible, visibleCount));
-    viewStart = Math.max(0, Math.min(Math.max(0, candles.length - visibleCount), viewStart));
+
+  clampViewport() {
+    this.visibleCount = Math.max(this.minVisible, Math.min(this.maxVisible, this.visibleCount));
+    this.viewStart = Math.max(0, Math.min(Math.max(0, this.candles.length - this.visibleCount), this.viewStart));
   }
-  function focusTradeRange() {
-    const ks = markers.map(m => m.idx);
+
+  focusTradeRange() {
+    const ks = this.markers.map(m => m.idx);
     if (ks.length) {
       const firstEv = Math.min(...ks), lastEv = Math.max(...ks), span = Math.max(lastEv - firstEv + 1, 16), padBars = Math.max(5, Math.round(span * 0.25));
-      viewStart = Math.max(0, firstEv - padBars); visibleCount = Math.min(candles.length, span + padBars * 2);
-    } else { viewStart = 0; visibleCount = Math.min(candles.length, 60); }
-    includeAllLevelsInScale = true; clampViewport();
-  }
-  function fitAllRange() { viewStart = 0; visibleCount = candles.length; includeAllLevelsInScale = true; clampViewport(); }
-  if (candles.length > 45) focusTradeRange(); else fitAllRange();
-  function getDimensions() {
-    if (container.classList.contains('chart-fullscreen')) {
-      const topChrome = (fsHeader?.offsetHeight || 0) + (toolbar?.offsetHeight || 36) + (fsReadout?.offsetHeight || 20) + 34;
-      return { width: Math.max(holder.clientWidth || window.innerWidth - 24, 260), height: Math.max(holder.clientHeight || (window.innerHeight - topChrome), 260) };
+      this.viewStart = Math.max(0, firstEv - padBars);
+      this.visibleCount = Math.min(this.candles.length, span + padBars * 2);
+    } else {
+      this.viewStart = 0;
+      this.visibleCount = Math.min(this.candles.length, 60);
     }
-    return { width: Math.max(holder.clientWidth || container.clientWidth || 320, 260), height: 280 };
+    this.includeAllLevelsInScale = true;
+    this.clampViewport();
   }
-  function updateHud(startIdx, endIdx) {
-    if (!hud) return;
-    if (activeIdx < startIdx || activeIdx > endIdx || activeIdx < 0 || activeIdx >= candles.length) {
-      hud.style.display = 'none';
+
+  fitAllRange() {
+    this.viewStart = 0;
+    this.visibleCount = this.candles.length;
+    this.includeAllLevelsInScale = true;
+    this.clampViewport();
+  }
+
+  zoomBy(factor, anchorRatio = 0.5) {
+    this.includeAllLevelsInScale = false;
+    const anchor = this.viewStart + anchorRatio * this.visibleCount;
+    this.visibleCount = Math.max(this.minVisible, Math.min(this.maxVisible, this.visibleCount * factor));
+    this.viewStart = anchor - anchorRatio * this.visibleCount;
+    this.clampViewport();
+    this.scheduleDraw();
+  }
+
+  clientXToCandleIdx(clientX) {
+    const rect = this.canvas.getBoundingClientRect();
+    const plotW = Math.max(rect.width - 82, 40);
+    return Math.max(0, Math.min(this.candles.length - 1, Math.floor(this.viewStart + ((clientX - rect.left - 10) / plotW) * this.visibleCount)));
+  }
+
+  toggleFullscreen(forceExit = false) {
+    if (!this.mounted) return;
+    const enable = forceExit ? false : !this.container.classList.contains('chart-fullscreen');
+    if (enable) {
+      if (this.container.parentNode !== document.body && this.container.parentNode) {
+        this.container.parentNode.insertBefore(this.placeholder, this.container);
+        document.body.appendChild(this.container);
+      }
+      this.container.classList.add('chart-fullscreen');
+      this.fsReadout.style.display = 'block';
+      this.fsBtn.innerHTML = '&#x2715; Exit Full';
+    } else if (this.container.classList.contains('chart-fullscreen')) {
+      this.container.classList.remove('chart-fullscreen');
+      this.fsReadout.style.display = 'none';
+      this.fsBtn.innerHTML = '&#x26F6; Full Screen';
+      if (this.placeholder.parentNode) {
+        this.placeholder.parentNode.insertBefore(this.container, this.placeholder);
+        this.placeholder.parentNode.removeChild(this.placeholder);
+      }
+    }
+    this.scheduleDraw();
+  }
+
+  getDimensions() {
+    if (this.container.classList.contains('chart-fullscreen')) {
+      const topChrome = (this.fsHeader?.offsetHeight || 0) + (this.toolbar?.offsetHeight || 36) + (this.fsReadout?.offsetHeight || 20) + 34;
+      return { width: Math.max(this.holder.clientWidth || window.innerWidth - 24, 260), height: Math.max(this.holder.clientHeight || (window.innerHeight - topChrome), 260) };
+    }
+    return { width: Math.max(this.holder.clientWidth || this.container.clientWidth || 320, 260), height: 280 };
+  }
+
+  updateHud(startIdx, endIdx) {
+    if (!this.hud) return;
+    if (this.activeIdx < startIdx || this.activeIdx > endIdx || this.activeIdx < 0 || this.activeIdx >= this.candles.length) {
+      this.hud.style.display = 'none';
       return;
     }
-    const c = candles[activeIdx];
+    const c = this.candles[this.activeIdx];
     const isBull = c.close >= c.open;
-    const isLeftHalf = (activeIdx - viewStart) < (visibleCount * 0.5);
-    hud.classList.toggle('hud-right', isLeftHalf);
+    const isLeftHalf = (this.activeIdx - this.viewStart) < (this.visibleCount * 0.5);
+    this.hud.classList.toggle('hud-right', isLeftHalf);
     let deltaHtml = '';
-    const entryRef = Number(chartData.entry_price);
-    if (chartData.entry_price != null && !isNaN(entryRef) && entryRef > 0) {
-      const isSell = String(chartData.direction || '').toUpperCase() === 'SELL';
+    const entryRef = Number(this.chartData.entry_price);
+    if (this.chartData.entry_price != null && !isNaN(entryRef) && entryRef > 0) {
+      const isSell = String(this.chartData.direction || '').toUpperCase() === 'SELL';
       const diff = isSell ? (entryRef - c.close) : (c.close - entryRef);
       const pct = (diff / entryRef) * 100;
       const sign = diff >= 0 ? '+' : '';
       deltaHtml = `<div class="chart-hud-delta ${diff >= 0 ? 'green-txt' : 'red'}">${sign}${pct.toFixed(2)}% vs Entry</div>`;
     }
-    const evList = markersByIdx.get(activeIdx) || [];
+    const evList = this.markersByIdx.get(this.activeIdx) || [];
     const evHtml = evList.length ? `<div class="chart-hud-note">&#x2605; ${esc(evList.map(e => e.detailText).join(' • '))}</div>` : '';
-    hud.innerHTML = `
+    this.hud.innerHTML = `
       <div class="chart-hud-head">
         <span>${esc(fmtShortTime(c.candle_timestamp))}</span>
         <span class="${isBull ? 'green-txt' : 'red'}">${isBull ? 'BULL' : 'BEAR'}</span>
@@ -559,31 +902,54 @@ function renderCandlestickChart(container, chartData, hoverOut, signalObj = null
       <div class="chart-hud-ohlc">O:${esc(fmtCompactPrice(c.open))} H:${esc(fmtCompactPrice(c.high))}</div>
       <div class="chart-hud-ohlc">L:${esc(fmtCompactPrice(c.low))} <b class="${isBull ? 'green-txt' : 'red'}">C:${esc(fmtCompactPrice(c.close))}</b></div>
       ${deltaHtml}${evHtml}`;
-    hud.style.display = 'block';
+    this.hud.style.display = 'block';
   }
-  function draw() {
-    if (!document.body.contains(container)) return;
-    const { width, height } = getDimensions();
+
+  scheduleDraw() {
+    if (this.destroyed || this.rafId) return;
+    this.rafId = requestAnimationFrame(() => {
+      this.rafId = 0;
+      this.draw();
+    });
+  }
+
+  draw() {
+    if (this.destroyed || !this.mounted || !this.candles.length || !document.body.contains(this.container)) return;
+    const { width, height } = this.getDimensions();
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
-      canvas.width = Math.round(width * dpr); canvas.height = Math.round(height * dpr);
-      canvas.style.width = width + 'px'; canvas.style.height = height + 'px';
+    if (this.canvas.width !== Math.round(width * dpr) || this.canvas.height !== Math.round(height * dpr)) {
+      this.canvas.width = Math.round(width * dpr);
+      this.canvas.height = Math.round(height * dpr);
+      this.canvas.style.width = width + 'px';
+      this.canvas.style.height = height + 'px';
     }
+    const ctx = this.ctx;
+    const candles = this.candles;
+    const chartData = this.chartData;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     const pad = { top: 22, right: 72, bottom: 26, left: 10 };
     const plotW = Math.max(width - pad.left - pad.right, 40), plotH = Math.max(height - pad.top - pad.bottom, 40);
-    const startIdx = Math.max(0, Math.floor(viewStart)), endIdx = Math.min(candles.length - 1, Math.ceil(viewStart + visibleCount));
+    const startIdx = Math.max(0, Math.floor(this.viewStart)), endIdx = Math.min(candles.length - 1, Math.ceil(this.viewStart + this.visibleCount));
     let cMin = Infinity, cMax = -Infinity;
-    for (let i = startIdx; i <= endIdx; i++) { if (candles[i].low < cMin) cMin = candles[i].low; if (candles[i].high > cMax) cMax = candles[i].high; }
+    for (let i = startIdx; i <= endIdx; i++) {
+      if (candles[i].low < cMin) cMin = candles[i].low;
+      if (candles[i].high > cMax) cMax = candles[i].high;
+    }
     if (!isFinite(cMin) || !isFinite(cMax)) { cMin = 0; cMax = 1; }
     let minP = cMin, maxP = cMax;
     const cSpan = Math.max(cMax - cMin, Math.abs(cMax) * 0.002 || 1);
-    const allLevels = [chartData.entry_price, ...(chartData.additional_entries || []), chartData.stop_loss, ...(chartData.targets || [])].filter(v => v != null && !isNaN(Number(v))).map(Number);
-    for (const lvl of allLevels) { if (includeAllLevelsInScale || (lvl >= cMin - cSpan * 0.6 && lvl <= cMax + cSpan * 0.6)) { if (lvl < minP) minP = lvl; if (lvl > maxP) maxP = lvl; } }
+    const allLevels = [chartData.entry_price, ...(chartData.additional_entries || []), chartData.stop_loss, ...(chartData.targets || [])]
+      .filter(v => v != null && !isNaN(Number(v))).map(Number);
+    for (const lvl of allLevels) {
+      if (this.includeAllLevelsInScale || (lvl >= cMin - cSpan * 0.6 && lvl <= cMax + cSpan * 0.6)) {
+        if (lvl < minP) minP = lvl;
+        if (lvl > maxP) maxP = lvl;
+      }
+    }
     if (minP === maxP) { minP -= 1; maxP += 1; }
     const margin = (maxP - minP) * 0.09; minP -= margin; maxP += margin;
     const yOf = p => pad.top + ((maxP - p) / (maxP - minP)) * plotH;
-    const stepX = plotW / Math.max(visibleCount, 1), xOf = idx => pad.left + (idx - viewStart + 0.5) * stepX;
+    const stepX = plotW / Math.max(this.visibleCount, 1), xOf = idx => pad.left + (idx - this.viewStart + 0.5) * stepX;
     const bodyW = Math.max(2, Math.min(14, stepX * 0.68));
     ctx.fillStyle = '#090f1d'; ctx.fillRect(0, 0, width, height);
     ctx.font = '10px ui-monospace, monospace'; ctx.textAlign = 'left';
@@ -593,13 +959,13 @@ function renderCandlestickChart(container, chartData, hoverOut, signalObj = null
       ctx.fillStyle = '#7f91b0'; ctx.fillText(fmtCompactPrice(p), width - pad.right + 5, y + 3);
     }
     ctx.save(); ctx.beginPath(); ctx.rect(pad.left, pad.top - 14, plotW, plotH + 14); ctx.clip();
-    function drawLevel(price, label, color) {
+    const drawLevel = (price, label, color) => {
       if (price == null || isNaN(Number(price))) return;
       const num = Number(price); if (num < minP || num > maxP) return;
       const y = yOf(num);
       ctx.save(); ctx.setLineDash([4, 4]); ctx.strokeStyle = color; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(width - pad.right, y); ctx.stroke(); ctx.restore();
       ctx.fillStyle = color; ctx.font = 'bold 10px ui-monospace, monospace'; ctx.fillText(`${label}: ${fmtCompactPrice(num)}`, pad.left + 4, Math.max(12, y - 3)); ctx.font = '10px ui-monospace, monospace';
-    }
+    };
     drawLevel(chartData.entry_price, 'E1', '#60a5fa');
     (chartData.additional_entries || []).forEach((eVal, i) => drawLevel(eVal, `E${i + 2}`, '#60a5fa'));
     drawLevel(chartData.stop_loss, 'SL', '#ff7285');
@@ -611,7 +977,7 @@ function renderCandlestickChart(container, chartData, hoverOut, signalObj = null
       const topY = yOf(Math.max(c.open, c.close)), botY = yOf(Math.min(c.open, c.close));
       ctx.fillRect(cx - bodyW / 2, topY, bodyW, Math.max(1.5, botY - topY));
     }
-    markers.forEach((m, mOrder) => {
+    this.markers.forEach((m, mOrder) => {
       if (m.idx < startIdx - 1 || m.idx > endIdx + 1) return;
       const cx = xOf(m.idx), cy = yOf(m.price);
       ctx.fillStyle = m.color; ctx.beginPath(); ctx.arc(cx, cy, 4.5, 0, Math.PI * 2); ctx.fill();
@@ -623,16 +989,15 @@ function renderCandlestickChart(container, chartData, hoverOut, signalObj = null
       ctx.fillStyle = m.color; ctx.fillRect(tagX, tagY - 10, tagW, 13);
       ctx.fillStyle = '#06131f'; ctx.fillText(m.label, tagX + 4, tagY);
     });
-    if (activeIdx >= startIdx && activeIdx <= endIdx) {
-      const c = candles[activeIdx], cx = xOf(activeIdx), cy = yOf(c.close);
+    if (this.activeIdx >= startIdx && this.activeIdx <= endIdx) {
+      const c = candles[this.activeIdx], cx = xOf(this.activeIdx), cy = yOf(c.close);
       ctx.save(); ctx.setLineDash([3, 3]); ctx.strokeStyle = 'rgba(231,237,249,0.75)'; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(cx, pad.top); ctx.lineTo(cx, height - pad.bottom); ctx.moveTo(pad.left, cy); ctx.lineTo(width - pad.right, cy); ctx.stroke(); ctx.restore();
       ctx.fillStyle = '#60a5fa'; ctx.beginPath(); ctx.arc(cx, cy, 3.5, 0, Math.PI * 2); ctx.fill();
     }
     ctx.restore();
-    // Highlighted Axis Pills when hovering, else default start/end labels
-    if (activeIdx >= startIdx && activeIdx <= endIdx) {
-      const c = candles[activeIdx], cx = xOf(activeIdx), cy = yOf(c.close);
+    if (this.activeIdx >= startIdx && this.activeIdx <= endIdx) {
+      const c = candles[this.activeIdx], cx = xOf(this.activeIdx), cy = yOf(c.close);
       const pTxt = fmtCompactPrice(c.close);
       ctx.fillStyle = '#60a5fa';
       const pillY = Math.max(pad.top, Math.min(height - pad.bottom - 16, cy - 8));
@@ -653,102 +1018,142 @@ function renderCandlestickChart(container, chartData, hoverOut, signalObj = null
       const endLbl = fmtShortTime(candles[endIdx].candle_timestamp);
       ctx.fillText(endLbl, Math.max(pad.left, width - pad.right - ctx.measureText(endLbl).width), height - 8);
     }
-    updateHud(startIdx, endIdx);
-    const statusText = (activeIdx >= 0 && activeIdx < candles.length)
+    this.updateHud(startIdx, endIdx);
+    const statusText = (this.activeIdx >= 0 && this.activeIdx < candles.length)
       ? (() => {
-          const c = candles[activeIdx], evList = markersByIdx.get(activeIdx) || [];
+          const c = candles[this.activeIdx], evList = this.markersByIdx.get(this.activeIdx) || [];
           const evNote = evList.length ? `  |  ★ ${evList.map(e => e.detailText).join(' • ')}` : '';
           return `${fmtDateTime(c.candle_timestamp)}  |  O: ${c.open}  H: ${c.high}  L: ${c.low}  C: ${c.close}${evNote}`;
         })()
       : `Showing bars ${startIdx + 1}–${endIdx + 1} of ${candles.length} (${chartData.provider} • ${chartData.trading_symbol || chartData.resolved_symbol})`;
-    if (hoverOut) hoverOut.textContent = statusText;
-    if (fsReadout) fsReadout.textContent = statusText;
+    if (this.hoverOut && this.hoverOut.textContent !== statusText) this.hoverOut.textContent = statusText;
+    if (this.fsReadout && this.fsReadout.textContent !== statusText) this.fsReadout.textContent = statusText;
   }
-  function zoomBy(factor, anchorRatio = 0.5) {
-    includeAllLevelsInScale = false;
-    const anchor = viewStart + anchorRatio * visibleCount;
-    visibleCount = Math.max(minVisible, Math.min(maxVisible, visibleCount * factor));
-    viewStart = anchor - anchorRatio * visibleCount;
-    clampViewport(); draw();
-  }
-  function clientXToCandleIdx(clientX) {
-    const rect = canvas.getBoundingClientRect();
-    const plotW = Math.max(rect.width - 82, 40);
-    return Math.max(0, Math.min(candles.length - 1, Math.floor(viewStart + ((clientX - rect.left - 10) / plotW) * visibleCount)));
-  }
-  function toggleFullscreen(forceExit = false) {
-    const enable = forceExit ? false : !container.classList.contains('chart-fullscreen');
-    if (enable) {
-      if (container.parentNode !== document.body && container.parentNode) { container.parentNode.insertBefore(placeholder, container); document.body.appendChild(container); }
-      container.classList.add('chart-fullscreen'); fsReadout.style.display = 'block'; fsBtn.innerHTML = '&#x2715; Exit Full';
-    } else if (container.classList.contains('chart-fullscreen')) {
-      container.classList.remove('chart-fullscreen'); fsReadout.style.display = 'none'; fsBtn.innerHTML = '&#x26F6; Full Screen';
-      if (placeholder.parentNode) { placeholder.parentNode.insertBefore(container, placeholder); placeholder.parentNode.removeChild(placeholder); }
+
+  destroy() {
+    if (this.destroyed) return;
+    if (this.container?.classList.contains('chart-fullscreen')) {
+      this.toggleFullscreen(true);
     }
-    requestAnimationFrame(draw);
+    this.destroyed = true;
+    if (this.rafId) { cancelAnimationFrame(this.rafId); this.rafId = 0; }
+    window.removeEventListener('mousemove', this._onWindowMouseMove);
+    window.removeEventListener('mouseup', this._onWindowMouseUp);
+    window.removeEventListener('resize', this._onWindowResize);
+    if (this.resizeObserver) { this.resizeObserver.disconnect(); this.resizeObserver = null; }
+    if (this.container) this.container._exitFullscreen = null;
+    if (chartInstances.get(this.signalId) === this) {
+      chartInstances.delete(this.signalId);
+    }
   }
-  container._exitFullscreen = () => toggleFullscreen(true);
-  container.querySelectorAll('.ch-btn').forEach(btn => {
-    btn.onclick = e => {
-      e.stopPropagation();
-      const act = btn.dataset.act;
-      if (act === 'zoom-in') zoomBy(0.65);
-      else if (act === 'zoom-out') zoomBy(1.5);
-      else if (act === 'focus') { focusTradeRange(); draw(); }
-      else if (act === 'fit') { fitAllRange(); draw(); }
-      else if (act === 'fullscreen') toggleFullscreen(false);
-    };
-  });
-  let mouseDown = false, dragStartX = 0, dragStartView = 0;
-  canvas.addEventListener('mousedown', e => { mouseDown = true; dragStartX = e.clientX; dragStartView = viewStart; });
-  window.addEventListener('mousemove', e => {
-    if (!mouseDown) return;
-    includeAllLevelsInScale = false;
-    viewStart = dragStartView - ((e.clientX - dragStartX) / Math.max(canvas.clientWidth - 82, 40)) * visibleCount;
-    clampViewport(); draw();
-  });
-  window.addEventListener('mouseup', () => { mouseDown = false; });
-  canvas.addEventListener('mousemove', e => { if (!mouseDown) { activeIdx = clientXToCandleIdx(e.clientX); draw(); } });
-  canvas.addEventListener('mouseleave', () => { if (!mouseDown) { activeIdx = -1; draw(); } });
-  canvas.addEventListener('dblclick', () => { activeIdx = -1; fitAllRange(); draw(); });
-  canvas.addEventListener('wheel', e => {
-    e.preventDefault();
-    const rect = canvas.getBoundingClientRect();
-    const plotW = Math.max(rect.width - 82, 40);
-    const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left - 10) / plotW));
-    zoomBy(e.deltaY > 0 ? 1.25 : 0.8, ratio);
-  }, { passive: false });
-  draw();
 }
 
-async function loadCardChart(signalId, forceRefresh = false) {
+function destroyChartInstance(signalId) {
+  const inst = chartInstances.get(signalId);
+  if (inst) inst.destroy();
+}
+
+function getOrCreateChartInstance(signalId, wrap, info) {
+  const existing = chartInstances.get(signalId);
+  if (existing && !existing.destroyed && existing.container === wrap) {
+    existing.hoverOut = info;
+    return existing;
+  }
+  if (existing) existing.destroy();
+  const inst = new CandlestickChartController(signalId, wrap, info);
+  chartInstances.set(signalId, inst);
+  return inst;
+}
+
+function renderCandlestickChart(container, chartData, hoverOut, signalObj = null, options = {}) {
+  const id = signalObj?.id ?? Number(container?.id?.replace('chart-wrap-', '') || 0);
+  const ctrl = getOrCreateChartInstance(id, container, hoverOut);
+  ctrl.updateData(chartData, signalObj, options);
+  return ctrl;
+}
+
+async function loadCardChart(signalId, forceRefreshOrOpts = false) {
+  const opts = typeof forceRefreshOrOpts === 'boolean'
+    ? { forceRefresh: forceRefreshOrOpts, silent: false, preserveViewport: true }
+    : { forceRefresh: false, silent: false, preserveViewport: true, ...forceRefreshOrOpts };
+
   const wrap = document.querySelector(`#chart-wrap-${signalId}`);
   const info = document.querySelector(`#chart-hover-${signalId}`);
   if (!wrap) return;
-  wrap.innerHTML = '<p class="muted" style="padding:12px">Loading OHLC candles &amp; markers...</p>';
-  try {
-    if (forceRefresh) await api(`/api/v1/signals/${signalId}/verify`, { method: 'POST' });
-    const data = await api(`/api/v1/signals/${signalId}/chart`);
-    chartCache.set(signalId, data);
-    const sigObj = lastSignalsData.find(x => x.id === signalId) || null;
-    renderCandlestickChart(wrap, data, info, sigObj);
-  } catch (e) {
-    wrap.innerHTML = `<p class="red" style="padding:12px">Chart error: ${esc(e.message)}</p>`;
+
+  const ctrl = getOrCreateChartInstance(signalId, wrap, info);
+  const sigObj = lastSignalsData.find(x => x.id === signalId) || null;
+
+  // Immediately render cached chart on first mount so expanding feels instant
+  if (!ctrl.mounted && chartCache.has(signalId)) {
+    ctrl.updateData(chartCache.get(signalId), sigObj, { preserveViewport: true });
   }
+
+  // Coalesce duplicate in-flight fetches for the same signal (unless forceRefresh)
+  if (chartInFlight.has(signalId) && !opts.forceRefresh) {
+    return chartInFlight.get(signalId);
+  }
+
+  if (!opts.silent || !ctrl.mounted) {
+    ctrl.setLoading(true, opts.forceRefresh ? 'Fetching...' : 'Updating...');
+  }
+
+  const task = (async () => {
+    try {
+      if (opts.forceRefresh) await api(`/api/v1/signals/${signalId}/verify`, { method: 'POST' });
+      const data = await api(`/api/v1/signals/${signalId}/chart`);
+      chartCache.set(signalId, data);
+      if (ctrl.destroyed || !expandedSignals.has(signalId)) return;
+      const freshSigObj = lastSignalsData.find(x => x.id === signalId) || sigObj;
+      ctrl.updateData(data, freshSigObj, { preserveViewport: opts.preserveViewport !== false });
+    } catch (e) {
+      if (!ctrl.destroyed) ctrl.setError(e.message);
+    } finally {
+      if (!ctrl.destroyed) ctrl.setLoading(false);
+      chartInFlight.delete(signalId);
+    }
+  })();
+
+  chartInFlight.set(signalId, task);
+  return task;
 }
 
-function renderSignalCard(r) {
-  const isExpanded = expandedSignals.has(r.id);
-  const isChecked = selectedSignals.has(r.id);
+function computeCardChartSignature(r) {
+  const evSig = (r.events || []).map(e => `${e.type}:${e.candle_time}:${e.price}:${e.label}`).join(';');
+  return [
+    r.id, r.updated_at || '', r.symbol || '', r.direction || '', r.entry_mode || '',
+    r.entry_price ?? '', (r.additional_entries || []).join(','), r.stop_loss ?? '', (r.targets || []).join(','),
+    r.option_type || '', r.strike_price ?? '', r.expiry_date || '',
+    r.verification_status || '', r.max_tp_hit || 0, r.closed_by_sl_after_tp ? 1 : 0,
+    r.notification_time || '', evSig
+  ].join('|');
+}
+
+function computeCardSignature(r, pnlBasis) {
+  const legsSig = (r.legs || []).map(l => `${l.leg}:${l.outcome}:${l.money_pnl}:${(l.targets_hit || []).join(',')}`).join(';');
+  const evSig = (r.events || []).map(e => `${e.type}:${e.candle_time}:${e.price}:${e.label}`).join(';');
+  const tpSig = (r.tp_levels || []).map(t => `${t.index}:${t.hit ? 1 : 0}:${t.money_pnl}`).join(';');
+  return [
+    r.id, r.updated_at || '', r.symbol || '', r.direction || '', r.entry_mode || '',
+    r.entry_price ?? '', (r.additional_entries || []).join(','), r.stop_loss ?? '', (r.targets || []).join(','),
+    r.option_type || '', r.strike_price ?? '', r.expiry_date || '',
+    r.parsing_status || '', r.parsing_explanation || '', r.verification_status || '',
+    r.final_result || '', r.basis_pnl_amount ?? '', r.pnl_amount ?? '', r.pnl_currency || '',
+    r.trades_count || 0, r.max_tp_hit || 0, r.all_targets_hit ? 1 : 0, r.closed_by_sl_after_tp ? 1 : 0,
+    r.monitoring_phase || '', r.age_minutes ?? '', r.is_manual_needed ? 1 : 0, r.is_auto_scheduled ? 1 : 0,
+    r.is_historical ? 1 : 0, r.next_scheduled_at || '', r.status_reason || '',
+    r.channel || '', r.category || '', r.notification_time || '', r.message || '',
+    pnlBasis || 'tp1', legsSig, evSig, tpSig
+  ].join('|');
+}
+
+function buildCardHeaderInnerHtml(r, isExpanded, isChecked) {
   const dirClass = r.direction === 'BUY' ? 'dir-buy' : r.direction === 'SELL' ? 'dir-sell' : 'dir-none';
   const isMarketNow = r.entry_mode === 'market_now';
   const isEdited = isEditedSignal(r);
   const needsReview = r.parsing_status !== 'parsed';
-  const targetsText = Array.isArray(r.targets) && r.targets.length ? r.targets.join(' / ') : '—';
   const optionMeta = (r.strike_price || r.option_type) ? ` ${r.strike_price || ''} ${r.option_type || ''}` : '';
   return `
-  <div class="signal-card ${isExpanded ? 'open' : ''} ${needsReview ? 'card-needs-review' : ''}" data-card-id="${r.id}">
-    <div class="signal-card-header" data-toggle-id="${r.id}">
       <label class="card-check" onclick="event.stopPropagation()">
         <input class="signal-select" data-id="${r.id}" type="checkbox" ${isChecked ? 'checked' : ''}>
       </label>
@@ -772,16 +1177,58 @@ function renderSignalCard(r) {
         ${needsReview ? `<button type="button" class="quick-fix-chip" data-quick-fix="${r.id}">Quick Fix &#x270E;</button>` : ''}
         ${statusBadge(r.verification_status, r.is_manual_needed, r.is_auto_scheduled, r.closed_by_sl_after_tp, r.max_tp_hit)}
         <span class="chevron">${isExpanded ? '▲' : '▼'}</span>
-      </div>
-    </div>
-    <div class="signal-card-body" style="display:${isExpanded ? 'block' : 'none'}">
+      </div>`;
+}
+
+function buildCardStatusHtml(r) {
+  return `
       <div class="status-banner ${r.is_manual_needed ? 'banner-warn' : 'banner-info'}">
         <b>Status &amp; Schedule:</b> ${esc(r.status_reason)}
         ${r.next_scheduled_at ? `<div class="muted" style="margin-top:4px">Next automatic candle fetch: <b>${esc(fmtDateTime(r.next_scheduled_at))}</b></div>` : ''}
-      </div>
-      ${buildLegsHtml(r)}
+      </div>`;
+}
+
+function buildCardParsedHtml(r) {
+  const isMarketNow = r.entry_mode === 'market_now';
+  const targetsText = Array.isArray(r.targets) && r.targets.length ? r.targets.join(' / ') : '—';
+  return `
+          <h4>Parsed Data</h4>
+          <div class="kv-grid">
+            <div><span>Symbol</span><b>${esc(r.symbol || '—')}</b></div>
+            <div><span>Direction</span><b>${esc(r.direction || '—')}</b></div>
+            <div><span>Entry 1</span><b>${esc(r.entry_price ?? (isMarketNow ? 'Market Now' : '—'))}</b></div>
+            <div><span>Extra Entries</span><b>${esc((r.additional_entries || []).join(', ') || '—')}</b></div>
+            <div><span>Stop Loss</span><b>${esc(r.stop_loss ?? '—')}</b></div>
+            <div><span>Targets</span><b>${esc(targetsText)}</b></div>
+            <div><span>Realized P&amp;L</span><b>${r.trades_count ? esc(fmtPnl(r.pnl_amount, r.pnl_currency)) : '—'}</b></div>
+            <div><span>Option</span><b>${esc([r.option_type, r.strike_price, r.expiry_date].filter(Boolean).join(' ') || '—')}</b></div>
+          </div>
+          <p class="muted" style="font-size:11px;margin:8px 0 0">${esc(r.parsing_explanation || '')}</p>`;
+}
+
+function buildCardRawHtml(r) {
+  return `
+          <h4>Original Raw Notification</h4>
+          <p class="muted" style="font-size:11px;margin:0 0 6px"><b>Sent:</b> ${esc(fmtDateTime(r.notification_time))} &bull; <b>Channel:</b> ${esc(r.channel)}</p>
+          <pre class="raw-msg-box">${esc(r.message)}</pre>`;
+}
+
+function createSignalCardElement(r) {
+  const isExpanded = expandedSignals.has(r.id);
+  const isChecked = selectedSignals.has(r.id);
+  const needsReview = r.parsing_status !== 'parsed';
+  const card = document.createElement('div');
+  card.className = `signal-card ${isExpanded ? 'open' : ''} ${needsReview ? 'card-needs-review' : ''}`;
+  card.dataset.cardId = String(r.id);
+  card.innerHTML = `
+    <div class="signal-card-header" data-toggle-id="${r.id}">
+      ${buildCardHeaderInnerHtml(r, isExpanded, isChecked)}
+    </div>
+    <div class="signal-card-body" style="display:${isExpanded ? 'block' : 'none'}">
+      <div class="card-status-slot">${buildCardStatusHtml(r)}</div>
+      <div class="card-legs-slot">${buildLegsHtml(r)}</div>
       <div class="dropdown-grid">
-        <div class="dd-panel"><h4>Trade Execution Timeline</h4>${buildTimelineHtml(r)}</div>
+        <div class="dd-panel"><h4>Trade Execution Timeline</h4><div class="card-timeline-slot">${buildTimelineHtml(r)}</div></div>
         <div class="dd-panel">
           <div class="toolbar" style="margin-bottom:6px">
             <h4 style="margin:0">Candle Chart &amp; Trade Markers</h4>
@@ -796,28 +1243,122 @@ function renderSignalCard(r) {
         </div>
       </div>
       <div class="dropdown-grid" style="margin-top:12px">
-        <div class="dd-panel">
-          <h4>Parsed Data</h4>
-          <div class="kv-grid">
-            <div><span>Symbol</span><b>${esc(r.symbol || '—')}</b></div>
-            <div><span>Direction</span><b>${esc(r.direction || '—')}</b></div>
-            <div><span>Entry 1</span><b>${esc(r.entry_price ?? (isMarketNow ? 'Market Now' : '—'))}</b></div>
-            <div><span>Extra Entries</span><b>${esc((r.additional_entries || []).join(', ') || '—')}</b></div>
-            <div><span>Stop Loss</span><b>${esc(r.stop_loss ?? '—')}</b></div>
-            <div><span>Targets</span><b>${esc(targetsText)}</b></div>
-            <div><span>Realized P&amp;L</span><b>${r.trades_count ? esc(fmtPnl(r.pnl_amount, r.pnl_currency)) : '—'}</b></div>
-            <div><span>Option</span><b>${esc([r.option_type, r.strike_price, r.expiry_date].filter(Boolean).join(' ') || '—')}</b></div>
-          </div>
-          <p class="muted" style="font-size:11px;margin:8px 0 0">${esc(r.parsing_explanation || '')}</p>
-        </div>
-        <div class="dd-panel">
-          <h4>Original Raw Notification</h4>
-          <p class="muted" style="font-size:11px;margin:0 0 6px"><b>Sent:</b> ${esc(fmtDateTime(r.notification_time))} &bull; <b>Channel:</b> ${esc(r.channel)}</p>
-          <pre class="raw-msg-box">${esc(r.message)}</pre>
-        </div>
+        <div class="dd-panel card-parsed-slot">${buildCardParsedHtml(r)}</div>
+        <div class="dd-panel card-raw-slot">${buildCardRawHtml(r)}</div>
       </div>
-    </div>
-  </div>`;
+    </div>`;
+
+  bindSignalCardEvents(card, r.id);
+  return card;
+}
+
+function bindCardHeaderEvents(headerEl, id) {
+  const chk = headerEl.querySelector('.signal-select');
+  if (chk) {
+    chk.onchange = () => {
+      if (chk.checked) selectedSignals.add(id); else selectedSignals.delete(id);
+      updateBatchBar();
+    };
+  }
+  const qf = headerEl.querySelector('[data-quick-fix]');
+  if (qf) {
+    qf.onclick = e => { e.stopPropagation(); reviewParse(id, null); };
+  }
+}
+
+function bindSignalCardEvents(card, id) {
+  const hdr = card.querySelector('.signal-card-header');
+  if (hdr) {
+    bindCardHeaderEvents(hdr, id);
+    hdr.onclick = () => {
+      const body = card.querySelector('.signal-card-body');
+      const chev = card.querySelector('.chevron');
+      if (expandedSignals.has(id)) {
+        expandedSignals.delete(id);
+        card.classList.remove('open');
+        body.style.display = 'none';
+        if (chev) chev.textContent = '▼';
+        destroyChartInstance(id);
+      } else {
+        expandedSignals.add(id);
+        card.classList.add('open');
+        body.style.display = 'block';
+        if (chev) chev.textContent = '▲';
+        loadCardChart(id, { forceRefresh: false, silent: false, preserveViewport: true });
+      }
+    };
+  }
+  const revBtn = card.querySelector('[data-review-card]');
+  if (revBtn) revBtn.onclick = e => { e.stopPropagation(); reviewParse(id, null); };
+
+  const refreshBtn = card.querySelector('.chart-refresh-btn[data-chart-id]');
+  if (refreshBtn) {
+    refreshBtn.onclick = e => {
+      e.stopPropagation();
+      busy(refreshBtn, 'Fetching...', async () => {
+        await loadCardChart(id, { forceRefresh: true, silent: false, preserveViewport: true });
+        await loadSignals({ skipChartRefresh: true });
+      });
+    };
+  }
+
+  const delBtn = card.querySelector('[data-delete-id]');
+  if (delBtn) {
+    delBtn.onclick = e => {
+      e.stopPropagation();
+      if (!confirm(`Delete signal #${id}?`)) return;
+      busy(delBtn, 'Deleting...', async () => {
+        await api(`/api/v1/signals/${id}`, { method: 'DELETE' });
+        selectedSignals.delete(id);
+        expandedSignals.delete(id);
+        destroyChartInstance(id);
+        chartCache.delete(id);
+        await loadSignals();
+      });
+    };
+  }
+}
+
+function patchSignalCardInPlace(card, r) {
+  const isExpanded = expandedSignals.has(r.id);
+  const isChecked = selectedSignals.has(r.id);
+  const needsReview = r.parsing_status !== 'parsed';
+  card.classList.toggle('open', isExpanded);
+  card.classList.toggle('card-needs-review', needsReview);
+
+  const hdr = card.querySelector('.signal-card-header');
+  if (hdr) {
+    hdr.innerHTML = buildCardHeaderInnerHtml(r, isExpanded, isChecked);
+    bindCardHeaderEvents(hdr, r.id);
+  }
+  const body = card.querySelector('.signal-card-body');
+  if (body) body.style.display = isExpanded ? 'block' : 'none';
+
+  const statusSlot = card.querySelector('.card-status-slot');
+  if (statusSlot) statusSlot.innerHTML = buildCardStatusHtml(r);
+
+  const legsSlot = card.querySelector('.card-legs-slot');
+  if (legsSlot) legsSlot.innerHTML = buildLegsHtml(r);
+
+  const tlSlot = card.querySelector('.card-timeline-slot');
+  if (tlSlot) tlSlot.innerHTML = buildTimelineHtml(r);
+
+  const parsedSlot = card.querySelector('.card-parsed-slot');
+  if (parsedSlot) parsedSlot.innerHTML = buildCardParsedHtml(r);
+
+  const rawSlot = card.querySelector('.card-raw-slot');
+  if (rawSlot) rawSlot.innerHTML = buildCardRawHtml(r);
+
+  // Note: #chart-wrap-{id} and #chart-hover-{id} are intentionally untouched!
+}
+
+function syncSelectionCheckboxes() {
+  document.querySelectorAll('#signals-list .signal-select').forEach(chk => {
+    const id = Number(chk.dataset.id);
+    const shouldCheck = selectedSignals.has(id);
+    if (chk.checked !== shouldCheck) chk.checked = shouldCheck;
+  });
+  updateBatchBar();
 }
 
 function getFilteredVisibleSignals() {
@@ -832,63 +1373,190 @@ function getFilteredVisibleSignals() {
   );
 }
 
-function renderSignalTable(data) {
+function ensureSignalsListShell(container) {
+  if (container.querySelector('#signals-section-recent')) return;
+  container.innerHTML = `
+    <div id="signals-empty-state" class="review-empty-state" style="display:none">
+      <p class="muted" style="margin:0">No signals match the active filters or search.</p>
+    </div>
+    <div id="signals-section-recent" style="display:none">
+      <div class="signal-section-header">
+        <div>
+          <h3 id="signals-recent-title">Recent &amp; Scheduled Signals (0)</h3>
+          <p class="muted">Signals within 1 hour or running automatic verification.</p>
+        </div>
+        <button type="button" id="select-live-group">Select recent (0)</button>
+      </div>
+      <div class="cards-stack" data-group="recent"></div>
+    </div>
+    <div id="signals-section-older" style="display:none">
+      <div class="signal-section-header older-header">
+        <div>
+          <h3 id="signals-older-title">Older &amp; Completed Signals (0)</h3>
+          <p class="muted">Select checkboxes to re-parse, process, or delete.</p>
+        </div>
+        <button type="button" id="select-older-group">Select older (0)</button>
+      </div>
+      <div class="cards-stack" data-group="older"></div>
+    </div>`;
+}
+
+function shouldSilentlyRefreshExpandedChart(id, chartDataRelevantChanged, options) {
+  if (options.skipChartRefresh) return false;
+  const ctrl = chartInstances.get(id);
+  if (!ctrl || !ctrl.mounted) return true; // Not mounted yet — load it
+  if (!options.fromWs) return true;        // Manual refresh — check silently in place
+  if (chartDataRelevantChanged) return true; // Signal status / events / levels actually changed
+  const batch = options.wsBatch;
+  if (!batch) return true;
+  if (batch.signalIds?.has(id)) return true;
+  if (batch.cacheKeys?.size) {
+    const cached = chartCache.get(id);
+    if (cached) {
+      const p = String(cached.provider || '').toUpperCase();
+      const s = String(cached.resolved_symbol || cached.symbol || '').toUpperCase();
+      if (batch.cacheKeys.has(`${p}:${s}`)) return true;
+      const tail = s.includes(':') ? s.split(':').pop() : s;
+      if (batch.cacheKeys.has(`${p}:${tail}`)) return true;
+    }
+  }
+  return false;
+}
+
+function renderSignalTable(data, options = {}) {
   const container = $('#signals-list');
+  if (!container) return;
   updateBatchBar();
+  ensureSignalsListShell(container);
+
+  const emptyEl = container.querySelector('#signals-empty-state');
+  const recentSec = container.querySelector('#signals-section-recent');
+  const olderSec = container.querySelector('#signals-section-older');
+  const recentStack = recentSec.querySelector('.cards-stack[data-group="recent"]');
+  const olderStack = olderSec.querySelector('.cards-stack[data-group="older"]');
+
+  // Map currently mounted cards by ID so we never rebuild unchanged DOM nodes
+  const existingCards = new Map();
+  container.querySelectorAll('.signal-card[data-card-id]').forEach(el => {
+    existingCards.set(Number(el.dataset.cardId), el);
+  });
+
   if (!data.length) {
-    container.innerHTML = `<div class="review-empty-state"><p class="muted" style="margin:0">No signals match the active filters or search.</p></div>`;
+    existingCards.forEach((el, id) => {
+      destroyChartInstance(id);
+      cardSignatures.delete(id);
+      cardChartSignatures.delete(id);
+      el.remove();
+    });
+    emptyEl.style.display = '';
+    recentSec.style.display = 'none';
+    olderSec.style.display = 'none';
     return;
   }
+
+  emptyEl.style.display = 'none';
   const recentLive = data.filter(r => !r.is_historical);
   const olderManual = data.filter(r => r.is_historical);
-  let html = '';
+
+  recentSec.style.display = recentLive.length ? '' : 'none';
+  olderSec.style.display = olderManual.length ? '' : 'none';
   if (recentLive.length) {
-    html += `<div class="signal-section-header"><div><h3>Recent &amp; Scheduled Signals (${recentLive.length})</h3><p class="muted">Signals within 1 hour or running automatic verification.</p></div><button type="button" id="select-live-group">Select recent (${recentLive.length})</button></div><div class="cards-stack">${recentLive.map(renderSignalCard).join('')}</div>`;
+    const t = container.querySelector('#signals-recent-title');
+    if (t) t.textContent = `Recent & Scheduled Signals (${recentLive.length})`;
+    const b = container.querySelector('#select-live-group');
+    if (b) {
+      b.textContent = `Select recent (${recentLive.length})`;
+      b.onclick = () => { recentLive.forEach(x => selectedSignals.add(x.id)); syncSelectionCheckboxes(); };
+    }
   }
   if (olderManual.length) {
-    html += `<div class="signal-section-header older-header"><div><h3>Older &amp; Completed Signals (${olderManual.length})</h3><p class="muted">Select checkboxes to re-parse, process, or delete.</p></div><button type="button" id="select-older-group">Select older (${olderManual.length})</button></div><div class="cards-stack">${olderManual.map(renderSignalCard).join('')}</div>`;
+    const t = container.querySelector('#signals-older-title');
+    if (t) t.textContent = `Older & Completed Signals (${olderManual.length})`;
+    const b = container.querySelector('#select-older-group');
+    if (b) {
+      b.textContent = `Select older (${olderManual.length})`;
+      b.onclick = () => { olderManual.forEach(x => selectedSignals.add(x.id)); syncSelectionCheckboxes(); };
+    }
   }
-  container.innerHTML = html;
-  document.querySelectorAll('.signal-select').forEach(x => {
-    x.onchange = () => {
-      if (x.checked) selectedSignals.add(+x.dataset.id); else selectedSignals.delete(+x.dataset.id);
-      updateBatchBar();
-    };
+
+  const visibleIds = new Set(data.map(r => r.id));
+  const changedCardIds = new Set();
+  const chartRelevantChangedIds = new Set();
+
+  // Remove cards that are no longer in the visible set first
+  existingCards.forEach((el, id) => {
+    if (!visibleIds.has(id)) {
+      destroyChartInstance(id);
+      cardSignatures.delete(id);
+      cardChartSignatures.delete(id);
+      el.remove();
+      existingCards.delete(id);
+    }
   });
-  document.querySelectorAll('[data-toggle-id]').forEach(hdr => {
-    hdr.onclick = () => {
-      const id = +hdr.dataset.toggleId;
-      const card = document.querySelector(`.signal-card[data-card-id="${id}"]`);
-      const body = card.querySelector('.signal-card-body');
-      const chev = card.querySelector('.chevron');
-      if (expandedSignals.has(id)) { expandedSignals.delete(id); card.classList.remove('open'); body.style.display = 'none'; chev.textContent = '▼'; }
-      else { expandedSignals.add(id); card.classList.add('open'); body.style.display = 'block'; chev.textContent = '▲'; loadCardChart(id, false); }
-    };
+
+  const reconcileGroup = (rows, stack) => {
+    rows.forEach((r, targetIdx) => {
+      const nextSig = computeCardSignature(r, sf.pnl_basis);
+      const nextChartSig = computeCardChartSignature(r);
+      let cardEl = existingCards.get(r.id);
+      if (!cardEl) {
+        cardEl = createSignalCardElement(r);
+        cardSignatures.set(r.id, nextSig);
+        cardChartSignatures.set(r.id, nextChartSig);
+        changedCardIds.add(r.id);
+        chartRelevantChangedIds.add(r.id);
+      } else {
+        const prevSig = cardSignatures.get(r.id);
+        const prevChartSig = cardChartSignatures.get(r.id);
+        if (prevChartSig !== nextChartSig) {
+          cardChartSignatures.set(r.id, nextChartSig);
+          chartRelevantChangedIds.add(r.id);
+        }
+        if (prevSig !== nextSig) {
+          patchSignalCardInPlace(cardEl, r);
+          cardSignatures.set(r.id, nextSig);
+          changedCardIds.add(r.id);
+        } else {
+          // Keep checkbox & expand state synchronized without touching DOM content
+          const chk = cardEl.querySelector('.signal-select');
+          if (chk) chk.checked = selectedSignals.has(r.id);
+          const isExp = expandedSignals.has(r.id);
+          cardEl.classList.toggle('open', isExp);
+          const body = cardEl.querySelector('.signal-card-body');
+          if (body && body.style.display !== (isExp ? 'block' : 'none')) {
+            body.style.display = isExp ? 'block' : 'none';
+          }
+          const chev = cardEl.querySelector('.chevron');
+          if (chev) chev.textContent = isExp ? '▲' : '▼';
+        }
+      }
+      // Only move DOM node if its parent or position actually differs (avoid needless reflows)
+      const currentAtPos = stack.children[targetIdx];
+      if (currentAtPos !== cardEl) {
+        stack.insertBefore(cardEl, currentAtPos || null);
+      }
+    });
+  };
+
+  reconcileGroup(recentLive, recentStack);
+  reconcileGroup(olderManual, olderStack);
+
+  // Silently update expanded charts ONLY when needed (never tearing down mounted canvases)
+  expandedSignals.forEach(id => {
+    if (!visibleIds.has(id)) return;
+    const chartRelChanged = chartRelevantChangedIds.has(id);
+    if (shouldSilentlyRefreshExpandedChart(id, chartRelChanged, options)) {
+      loadCardChart(id, { forceRefresh: false, silent: true, preserveViewport: true });
+    } else if (changedCardIds.has(id)) {
+      // Update fullscreen header badges in place without a network call if already mounted
+      const ctrl = chartInstances.get(id);
+      const cached = chartCache.get(id);
+      const sigObj = data.find(x => x.id === id) || null;
+      if (ctrl && ctrl.mounted && cached) {
+        ctrl.updateData(cached, sigObj, { preserveViewport: true });
+      }
+    }
   });
-  document.querySelectorAll('[data-quick-fix]').forEach(btn => {
-    btn.onclick = e => { e.stopPropagation(); reviewParse(+btn.dataset.quickFix, null); };
-  });
-  document.querySelectorAll('[data-review-card]').forEach(btn => {
-    btn.onclick = e => { e.stopPropagation(); reviewParse(+btn.dataset.reviewCard, null); };
-  });
-  document.querySelectorAll('.chart-refresh-btn[data-chart-id]').forEach(btn => {
-    btn.onclick = e => {
-      e.stopPropagation();
-      const id = +btn.dataset.chartId;
-      busy(btn, 'Fetching...', async () => { await loadCardChart(id, true); await loadSignals(); });
-    };
-  });
-  document.querySelectorAll('[data-delete-id]').forEach(btn => {
-    btn.onclick = e => {
-      e.stopPropagation();
-      const id = +btn.dataset.deleteId;
-      if (!confirm(`Delete signal #${id}?`)) return;
-      busy(btn, 'Deleting...', async () => { await api(`/api/v1/signals/${id}`, { method: 'DELETE' }); selectedSignals.delete(id); expandedSignals.delete(id); await loadSignals(); });
-    };
-  });
-  if ($('#select-live-group')) $('#select-live-group').onclick = () => { recentLive.forEach(x => selectedSignals.add(x.id)); renderSignalTable(data); };
-  if ($('#select-older-group')) $('#select-older-group').onclick = () => { olderManual.forEach(x => selectedSignals.add(x.id)); renderSignalTable(data); };
-  expandedSignals.forEach(id => { if (data.some(x => x.id === id)) loadCardChart(id, false); });
 }
 
 async function openSignalInManagement(signalId) {
@@ -1646,23 +2314,30 @@ function renderActiveFilterChips() {
   });
 }
 
-async function loadSignals() {
+async function loadSignals(options = {}) {
+  const seq = ++signalsLoadSeq;
   let f = await api('/api/v1/signals/filters' + (sf.category ? '?category=' + encodeURIComponent(sf.category) : ''));
-  const catButtons = [
-    `<button class="category-filter ${sf.category === '' ? 'active' : ''}" data-cat="">All Categories</button>`,
-    ...f.categories.map(c => `<button class="category-filter ${c === sf.category ? 'active' : ''}" data-cat="${esc(c)}">${esc(c)}</button>`)
-  ];
-  $('#category-filters').innerHTML = catButtons.join('');
-  let s = $('#channel-filter');
-  s.innerHTML = '<option value="">All channels</option>' + f.channels.map(c => `<option>${esc(c)}</option>`).join('');
-  s.value = sf.channel;
+  if (seq !== signalsLoadSeq) return;
+
+  const filtersSig = `${sf.category}|${(f.categories || []).join(',')}|${(f.channels || []).join(',')}`;
+  if (filtersSig !== lastFiltersSignature) {
+    lastFiltersSignature = filtersSig;
+    const catButtons = [
+      `<button class="category-filter ${sf.category === '' ? 'active' : ''}" data-cat="">All Categories</button>`,
+      ...f.categories.map(c => `<button class="category-filter ${c === sf.category ? 'active' : ''}" data-cat="${esc(c)}">${esc(c)}</button>`)
+    ];
+    $('#category-filters').innerHTML = catButtons.join('');
+    let s = $('#channel-filter');
+    s.innerHTML = '<option value="">All channels</option>' + f.channels.map(c => `<option>${esc(c)}</option>`).join('');
+    document.querySelectorAll('[data-cat]').forEach(b => b.onclick = () => { sf.category = b.dataset.cat; sf.channel = ''; loadSignals(); });
+  }
+  $('#channel-filter').value = sf.channel;
   $('#verification-filter').value = sf.status;
   if ($('#tp-filter')) $('#tp-filter').value = sf.tp_filter;
   if ($('#pnl-basis-filter')) $('#pnl-basis-filter').value = sf.pnl_basis;
   if ($('#signal-date-from')) $('#signal-date-from').value = sf.date_from;
   if ($('#signal-date-to')) $('#signal-date-to').value = sf.date_to;
   $('#notification-type-filter').value = sf.notification_filter;
-  document.querySelectorAll('[data-cat]').forEach(b => b.onclick = () => { sf.category = b.dataset.cat; sf.channel = ''; loadSignals(); });
   renderActiveFilterChips();
 
   let q = new URLSearchParams(sf);
@@ -1672,6 +2347,8 @@ async function loadSignals() {
     api('/api/v1/signals' + qs),
     api('/api/v1/signals/summary' + qs)
   ]);
+  if (seq !== signalsLoadSeq) return;
+
   lastSignalsData = data;
   lastSignalsSummary = summary;
 
@@ -1686,42 +2363,46 @@ async function loadSignals() {
 
   const sumHost = $('#signals-pnl-summary');
   if (sumHost && summary) {
-    const basisLbl = { tp1: 'TP1', tp2: 'TP2', tp3: 'TP3', highest_tp: 'Best TP' }[summary.basis] || 'TP1';
-    const inrCls = Number(summary.pnl_inr || 0) >= 0 ? 'green-txt' : 'red';
-    const usdCls = Number(summary.pnl_usd || 0) >= 0 ? 'green-txt' : 'red';
-    sumHost.innerHTML = `
-      <div class="pnl-summary-metrics">
-        <span><b>${esc(summary.total_signals)}</b> sigs</span>
-        <span>Win <b class="${Number(summary.win_rate) >= 50 ? 'green-txt' : ''}">${esc(summary.win_rate)}%</b></span>
-        <button type="button" id="cycle-pnl-basis-btn" class="basis-cycle-pill">Basis: ${esc(basisLbl)} &#x21BB;</button>
-        <span>TP1:<b>${esc(summary.tp1_hits)}</b></span>
-        <span>TP2:<b>${esc(summary.tp2_hits)}</b></span>
-        <span>TP3:<b>${esc(summary.tp3_hits)}</b></span>
-        <span>TP→SL:<b>${esc(summary.tp_then_sl_hits)}</b></span>
-        <span>SL:<b>${esc(summary.sl_only_hits)}</b></span>
-        <span>Active:<b>${esc(summary.active_monitoring)}</b></span>
-      </div>
-      <div class="pnl-summary-totals">
-        <span class="${inrCls}">${esc(fmtPnl(summary.pnl_inr, 'INR'))}</span>
-        ${Number(summary.pnl_usd || 0) !== 0 ? `<span class="${usdCls}">${esc(fmtPnl(summary.pnl_usd, 'USD'))}</span>` : ''}
-      </div>`;
-    const cycleBtn = $('#cycle-pnl-basis-btn');
-    if (cycleBtn) {
-      cycleBtn.onclick = () => {
-        const order = ['tp1', 'tp2', 'tp3', 'highest_tp'];
-        sf.pnl_basis = order[(order.indexOf(sf.pnl_basis) + 1) % order.length];
-        loadSignals();
-      };
+    const sumSig = `${summary.basis}|${summary.total_signals}|${summary.win_rate}|${summary.tp1_hits}|${summary.tp2_hits}|${summary.tp3_hits}|${summary.tp_then_sl_hits}|${summary.sl_only_hits}|${summary.active_monitoring}|${summary.pnl_inr}|${summary.pnl_usd}`;
+    if (sumSig !== lastSummarySignature) {
+      lastSummarySignature = sumSig;
+      const basisLbl = { tp1: 'TP1', tp2: 'TP2', tp3: 'TP3', highest_tp: 'Best TP' }[summary.basis] || 'TP1';
+      const inrCls = Number(summary.pnl_inr || 0) >= 0 ? 'green-txt' : 'red';
+      const usdCls = Number(summary.pnl_usd || 0) >= 0 ? 'green-txt' : 'red';
+      sumHost.innerHTML = `
+        <div class="pnl-summary-metrics">
+          <span><b>${esc(summary.total_signals)}</b> sigs</span>
+          <span>Win <b class="${Number(summary.win_rate) >= 50 ? 'green-txt' : ''}">${esc(summary.win_rate)}%</b></span>
+          <button type="button" id="cycle-pnl-basis-btn" class="basis-cycle-pill">Basis: ${esc(basisLbl)} &#x21BB;</button>
+          <span>TP1:<b>${esc(summary.tp1_hits)}</b></span>
+          <span>TP2:<b>${esc(summary.tp2_hits)}</b></span>
+          <span>TP3:<b>${esc(summary.tp3_hits)}</b></span>
+          <span>TP→SL:<b>${esc(summary.tp_then_sl_hits)}</b></span>
+          <span>SL:<b>${esc(summary.sl_only_hits)}</b></span>
+          <span>Active:<b>${esc(summary.active_monitoring)}</b></span>
+        </div>
+        <div class="pnl-summary-totals">
+          <span class="${inrCls}">${esc(fmtPnl(summary.pnl_inr, 'INR'))}</span>
+          ${Number(summary.pnl_usd || 0) !== 0 ? `<span class="${usdCls}">${esc(fmtPnl(summary.pnl_usd, 'USD'))}</span>` : ''}
+        </div>`;
+      const cycleBtn = $('#cycle-pnl-basis-btn');
+      if (cycleBtn) {
+        cycleBtn.onclick = () => {
+          const order = ['tp1', 'tp2', 'tp3', 'highest_tp'];
+          sf.pnl_basis = order[(order.indexOf(sf.pnl_basis) + 1) % order.length];
+          loadSignals();
+        };
+      }
     }
   }
 
   const visibleData = getFilteredVisibleSignals();
-  renderSignalTable(visibleData);
+  renderSignalTable(visibleData, options);
 
-  let selectCurrent = () => { getFilteredVisibleSignals().forEach(x => selectedSignals.add(x.id)); renderSignalTable(getFilteredVisibleSignals()); };
+  let selectCurrent = () => { getFilteredVisibleSignals().forEach(x => selectedSignals.add(x.id)); syncSelectionCheckboxes(); };
   $('#select-all').onclick = selectCurrent;
   if ($('#select-filtered')) $('#select-filtered').onclick = selectCurrent;
-  $('#clear-selection').onclick = () => { selectedSignals.clear(); renderSignalTable(getFilteredVisibleSignals()); };
+  $('#clear-selection').onclick = () => { selectedSignals.clear(); syncSelectionCheckboxes(); };
   $('#reparse-selected').onclick = () => busy($('#reparse-selected'), 'Re-parsing...', async () => {
     let r = await api('/api/v1/signals/reparse', { method: 'POST', body: JSON.stringify({ signal_ids: [...selectedSignals] }) });
     $('#process-result').textContent = `Re-parsed ${r.results.length} selected signals.`;
@@ -1732,7 +2413,7 @@ async function loadSignals() {
     if (!ids.length || !confirm(`Delete ${ids.length} selected signal(s)?`)) return;
     busy($('#delete-selected'), 'Deleting...', async () => {
       const r = await api('/api/v1/signals/delete', { method: 'POST', body: JSON.stringify({ signal_ids: ids }) });
-      ids.forEach(id => { selectedSignals.delete(id); expandedSignals.delete(id); });
+      ids.forEach(id => { selectedSignals.delete(id); expandedSignals.delete(id); destroyChartInstance(id); chartCache.delete(id); });
       $('#process-result').textContent = `Deleted ${r.deleted} signal(s).`;
       loadSignals();
     });
@@ -2151,6 +2832,10 @@ async function loadLogs() {
 }
 
 function show(view) {
+  if (view !== 'signals') {
+    const fsChart = document.querySelector('.chart-box.chart-fullscreen');
+    if (fsChart && typeof fsChart._exitFullscreen === 'function') fsChart._exitFullscreen();
+  }
   currentView = view;
   document.querySelectorAll('nav button,.view').forEach(x => x.classList.remove('active'));
   document.querySelector(`[data-view="${view}"]`).classList.add('active');
@@ -2160,7 +2845,7 @@ function show(view) {
   if (!authSessionToken) return;
   loadApiHealth().catch(() => {});
   ({
-    overview, inbox: loadInboxView, notifications: notificationLog, integrations, signals: loadSignals,
+    overview, inbox: loadInboxView, notifications: notificationLog, integrations, signals: () => loadSignals(),
     market: async () => { await loadApiHealth(); await coverage(); updateProviderUI(); },
     analytics: loadAnalytics, logs: loadLogs,
     settings: async () => {
@@ -2239,7 +2924,7 @@ if ($('#signal-search')) {
   $('#signal-search').oninput = e => {
     signalSearchQuery = e.target.value || '';
     renderActiveFilterChips();
-    renderSignalTable(getFilteredVisibleSignals());
+    renderSignalTable(getFilteredVisibleSignals(), { skipChartRefresh: true });
   };
 }
 $('#channel-filter').onchange = e => { sf.channel = e.target.value; loadSignals(); };

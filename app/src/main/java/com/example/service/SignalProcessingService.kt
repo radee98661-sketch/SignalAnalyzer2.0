@@ -38,6 +38,11 @@ data class ServiceStatus(
     val bindHost: String = "127.0.0.1",
     val port: Int = 8765,
     val lanIp: String = "127.0.0.1",
+    val lanInterfaceName: String? = null,
+    val allLanIps: List<Pair<String, String>> = emptyList(),
+    val onWifi: Boolean = false,
+    val vpnActive: Boolean = false,
+    val vpnDetail: String? = null,
     val activeWsClients: Int = 0,
     val lastSchedulerTickAt: String? = null,
     val lastHeartbeatAt: String? = null,
@@ -84,7 +89,8 @@ class SignalProcessingService : Service() {
 
         stoppedByUser.set(false)
         createNotificationChannel()
-        val lanIp = NetworkUtils.getLocalLanIpv4()
+        val netSnap = NetworkUtils.getLanNetworkSnapshot(applicationContext)
+        val lanIp = netSnap.primaryIp
         val bindHost = if (lanEnabled) "0.0.0.0" else "127.0.0.1"
 
         val notif = buildNotification(dedicated, lanEnabled, lanIp, port)
@@ -117,6 +123,11 @@ class SignalProcessingService : Service() {
             bindHost = bindHost,
             port = port,
             lanIp = lanIp,
+            lanInterfaceName = netSnap.interfaceName,
+            allLanIps = netSnap.allLanIps,
+            onWifi = netSnap.onWifi,
+            vpnActive = netSnap.vpnActive,
+            vpnDetail = netSnap.vpnDetail,
             activeWsClients = container.lanServer.activeWsClientCount(),
             lastHeartbeatAt = TimeUtils.utcNowIso(),
             lastError = lanErr
@@ -228,10 +239,34 @@ class SignalProcessingService : Service() {
             statusPollJob = serviceScope.launch {
                 while (isActive) {
                     try {
-                        val lanIp = NetworkUtils.getLocalLanIpv4()
+                        val netSnap = NetworkUtils.getLanNetworkSnapshot(applicationContext)
                         val clients = container.lanServer.activeWsClientCount()
-                        if (_status.value.lanIp != lanIp || _status.value.activeWsClients != clients) {
-                            _status.value = _status.value.copy(lanIp = lanIp, activeWsClients = clients)
+                        val cur = _status.value
+                        if (cur.lanIp != netSnap.primaryIp ||
+                            cur.lanInterfaceName != netSnap.interfaceName ||
+                            cur.allLanIps != netSnap.allLanIps ||
+                            cur.onWifi != netSnap.onWifi ||
+                            cur.vpnActive != netSnap.vpnActive ||
+                            cur.vpnDetail != netSnap.vpnDetail ||
+                            cur.activeWsClients != clients
+                        ) {
+                            val ipChanged = cur.lanIp != netSnap.primaryIp
+                            _status.value = cur.copy(
+                                lanIp = netSnap.primaryIp,
+                                lanInterfaceName = netSnap.interfaceName,
+                                allLanIps = netSnap.allLanIps,
+                                onWifi = netSnap.onWifi,
+                                vpnActive = netSnap.vpnActive,
+                                vpnDetail = netSnap.vpnDetail,
+                                activeWsClients = clients
+                            )
+                            if (ipChanged && cur.lanDashboardEnabled) {
+                                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                                nm?.notify(
+                                    NOTIFICATION_ID,
+                                    buildNotification(cur.dedicatedProcessingEnabled, true, netSnap.primaryIp, cur.port)
+                                )
+                            }
                         }
                     } catch (e: CancellationException) {
                         throw e

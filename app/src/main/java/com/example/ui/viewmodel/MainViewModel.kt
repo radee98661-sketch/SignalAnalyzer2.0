@@ -20,6 +20,7 @@ import com.example.domain.model.SourceNotificationRow
 import com.example.domain.parser.DefaultRulesEngine
 import com.example.domain.parser.SignalParser
 import com.example.service.BackgroundHealthSnapshot
+import com.example.service.LanNetworkSnapshot
 import com.example.service.NetworkUtils
 import com.example.service.ServiceStatus
 import com.example.service.SignalProcessingService
@@ -151,7 +152,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _lanToken = MutableStateFlow(container.lanAuthManager.currentBearerToken())
     val lanToken: StateFlow<String> = _lanToken.asStateFlow()
 
-    private val _lanIp = MutableStateFlow(NetworkUtils.getLocalLanIpv4())
+    private val _lanNetwork = MutableStateFlow(NetworkUtils.getLanNetworkSnapshot(app))
+    val lanNetwork: StateFlow<LanNetworkSnapshot> = _lanNetwork.asStateFlow()
+
+    private val _lanIp = MutableStateFlow(_lanNetwork.value.primaryIp)
     val lanIp: StateFlow<String> = _lanIp.asStateFlow()
 
     private val _isBusy = MutableStateFlow(false)
@@ -213,7 +217,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             refreshApiHealth()
             refreshSettings()
             refreshSystemLogs()
-            _lanIp.value = NetworkUtils.getLocalLanIpv4()
+            val snap = NetworkUtils.getLanNetworkSnapshot(app)
+            _lanNetwork.value = snap
+            _lanIp.value = snap.primaryIp
         }
     }
 
@@ -652,12 +658,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun refreshLanNetwork(): LanNetworkSnapshot {
+        val snap = NetworkUtils.getLanNetworkSnapshot(app)
+        _lanNetwork.value = snap
+        _lanIp.value = snap.primaryIp
+        return snap
+    }
+
     fun updateServiceState(dedicated: Boolean, lanEnabled: Boolean, port: Int) {
         val safePort = port.coerceIn(1024, 65535)
         viewModelScope.launch(Dispatchers.IO) {
             repo.saveSettings(mapOf("lan_port" to safePort.toString()))
         }
-        _lanIp.value = NetworkUtils.getLocalLanIpv4()
+        refreshLanNetwork()
         SignalProcessingService.startOrUpdate(app, dedicated, lanEnabled, safePort)
     }
 

@@ -1,11 +1,16 @@
 package com.example.ui.screens
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -16,19 +21,26 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Backup
 import androidx.compose.material.icons.filled.BatteryAlert
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.FileUpload
+import androidx.compose.material.icons.filled.Lan
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.VpnLock
+import androidx.compose.material.icons.filled.WifiOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
@@ -44,6 +56,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -55,11 +68,13 @@ import com.example.ui.components.StatusPill
 import com.example.ui.components.formatShortTimestamp
 import com.example.ui.theme.AmberContainer
 import com.example.ui.theme.AmberWarn
+import com.example.ui.theme.CoralContainer
 import com.example.ui.theme.CoralRed
 import com.example.ui.theme.EmeraldAccent
 import com.example.ui.theme.EmeraldContainer
 import com.example.ui.theme.MonoFontFamily
 import com.example.ui.theme.NavyBorder
+import com.example.ui.theme.NavyCardElevated
 import com.example.ui.theme.SignalBlue
 import com.example.ui.theme.TextSecondary
 import com.example.ui.viewmodel.MainViewModel
@@ -101,10 +116,11 @@ private fun ServerLanTab(
     val bgHealth by viewModel.backgroundHealth.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val lanToken by viewModel.lanToken.collectAsStateWithLifecycle()
-    val lanIp by viewModel.lanIp.collectAsStateWithLifecycle()
+    val lanNetwork by viewModel.lanNetwork.collectAsStateWithLifecycle()
 
     LaunchedEffect(Unit) {
         viewModel.refreshBackgroundHealth()
+        viewModel.refreshLanNetwork()
     }
 
     var portText by remember { mutableStateOf("8765") }
@@ -112,6 +128,14 @@ private fun ServerLanTab(
         settings["lan_port"]?.takeIf { it.isNotBlank() }?.let { portText = it }
     }
     val portInt = (portText.toIntOrNull() ?: 8765).coerceIn(1024, 65535)
+    val effectivePort = if (status.running && status.lanDashboardEnabled) status.port else portInt
+    val liveLanIp = if (status.running && status.lanIp != "127.0.0.1") status.lanIp else lanNetwork.primaryIp
+    val liveIface = if (status.running && status.lanInterfaceName != null) status.lanInterfaceName else lanNetwork.interfaceName
+    val liveAllIps = if (status.running && status.allLanIps.isNotEmpty()) status.allLanIps else lanNetwork.allLanIps
+    val liveOnWifi = if (status.running) status.onWifi else lanNetwork.onWifi
+    val liveVpnActive = if (status.running) status.vpnActive else lanNetwork.vpnActive
+    val liveVpnDetail = if (status.running) status.vpnDetail else lanNetwork.vpnDetail
+    val liveLanUrl = "http://$liveLanIp:$effectivePort"
     val ignoringBattery = remember(status.running, bgHealth.ignoringBatteryOptimizations) {
         NetworkUtils.isIgnoringBatteryOptimizations(ctx)
     }
@@ -183,6 +207,159 @@ private fun ServerLanTab(
                     singleLine = true
                 )
 
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = NavyCardElevated,
+                    border = BorderStroke(1.dp, if (status.lanDashboardEnabled && liveLanIp != "127.0.0.1") EmeraldAccent.copy(alpha = 0.45f) else NavyBorder),
+                    modifier = Modifier.fillMaxWidth().testTag("live_lan_url_card")
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(
+                                    Icons.Default.Lan,
+                                    contentDescription = "Live LAN address",
+                                    tint = if (liveLanIp != "127.0.0.1") EmeraldAccent else AmberWarn,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Text(
+                                    text = if (liveIface != null) "Live LAN URL ($liveIface)" else "Live LAN URL",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = TextSecondary
+                                )
+                            }
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                IconButton(
+                                    onClick = {
+                                        val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                        cm?.setPrimaryClip(ClipData.newPlainText("LAN URL", liveLanUrl))
+                                        viewModel.setStatusMessage("Copied $liveLanUrl")
+                                    },
+                                    modifier = Modifier.testTag("copy_live_lan_url_button")
+                                ) {
+                                    Icon(
+                                        Icons.Default.ContentCopy,
+                                        contentDescription = "Copy live LAN URL",
+                                        tint = SignalBlue,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                                IconButton(
+                                    onClick = {
+                                        val fresh = viewModel.refreshLanNetwork()
+                                        val vpnNote = if (fresh.vpnActive) " • VPN active" else ""
+                                        viewModel.setStatusMessage("LAN IP: http://${fresh.primaryIp}:$effectivePort$vpnNote")
+                                    },
+                                    modifier = Modifier.testTag("refresh_live_lan_ip_button")
+                                ) {
+                                    Icon(
+                                        Icons.Default.Refresh,
+                                        contentDescription = "Refresh LAN IP",
+                                        tint = TextSecondary,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                            }
+                        }
+                        Text(
+                            text = liveLanUrl,
+                            style = MaterialTheme.typography.titleMedium.copy(
+                                fontFamily = MonoFontFamily,
+                                fontWeight = FontWeight.SemiBold
+                            ),
+                            color = if (liveLanIp != "127.0.0.1") EmeraldAccent else AmberWarn,
+                            modifier = Modifier.testTag("live_lan_url_text")
+                        )
+                        val extraIps = liveAllIps.filter { it.second != liveLanIp }
+                        if (extraIps.isNotEmpty()) {
+                            Text(
+                                text = "Other LAN IPs: " + extraIps.joinToString(" • ") { (iface, ip) -> "$iface: http://$ip:$effectivePort" },
+                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = MonoFontFamily),
+                                color = TextSecondary
+                            )
+                        }
+                    }
+                }
+
+                AnimatedVisibility(visible = liveVpnActive) {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = AmberContainer,
+                        border = BorderStroke(1.dp, AmberWarn.copy(alpha = 0.6f)),
+                        modifier = Modifier.fillMaxWidth().testTag("active_vpn_warning_banner")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            verticalAlignment = Alignment.Top
+                        ) {
+                            Icon(
+                                Icons.Default.VpnLock,
+                                contentDescription = "Active VPN warning",
+                                tint = AmberWarn,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text(
+                                    text = "Active VPN / Local VPN Tunnel Detected",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = AmberWarn
+                                )
+                                Text(
+                                    text = "${liveVpnDetail ?: "VPN tunnel active"}. VPNs and local VPN ad-blockers/firewalls can block Wi-Fi LAN browsers (ERR_CONNECTION_TIMED_OUT). Pause the VPN or allow Local LAN / exclude Signal Analyzer.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                        }
+                    }
+                }
+
+                AnimatedVisibility(visible = status.lanDashboardEnabled && (!liveOnWifi || liveLanIp == "127.0.0.1")) {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = CoralContainer,
+                        border = BorderStroke(1.dp, CoralRed.copy(alpha = 0.55f)),
+                        modifier = Modifier.fillMaxWidth().testTag("no_wifi_lan_warning_banner")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            verticalAlignment = Alignment.Top
+                        ) {
+                            Icon(
+                                Icons.Default.WifiOff,
+                                contentDescription = "No Wi-Fi LAN connection",
+                                tint = CoralRed,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text(
+                                    text = "No Wi-Fi LAN Address Detected",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = CoralRed
+                                )
+                                Text(
+                                    text = "Connect this phone and your desktop to the same Wi-Fi network so the LAN dashboard gets a reachable 192.168.x.x / 10.x.x.x address.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                        }
+                    }
+                }
+
                 Text(
                     "Status: ${if (status.running) "Running on ${status.bindHost}:${status.port}" else "Idle (local-only mode)"} • WS Clients: ${status.activeWsClients}",
                     style = MaterialTheme.typography.labelSmall.copy(fontFamily = MonoFontFamily),
@@ -221,7 +398,7 @@ private fun ServerLanTab(
 
         item {
             QrCodeCard(
-                url = "http://${if (status.lanDashboardEnabled) status.lanIp else lanIp}:$portInt",
+                url = liveLanUrl,
                 bearerToken = lanToken,
                 onRotateToken = { viewModel.rotateLanToken() },
                 onCopiedMessage = { viewModel.setStatusMessage(it) }

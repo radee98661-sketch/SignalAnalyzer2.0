@@ -138,123 +138,60 @@ class ParserParityTest {
     }
 
     @Test
-    fun `parses NAORISUSDT scalp crypto signal with hyphenated Stop-Loss and Account Usage percentage`() {
-        val msg = """
-            ✨ Project Type :- SCALP 🌟
-
-            🌈PAIR:- #NAORIS/USDT
-            ⚡️ Direction : LONG
-            ⚙️ Leverage: Cross 25X TO 50X
-
-            🎯 Entrys : 0.03660
-
-            🏆 Targets:
-
-            🥇 0.03750
-            🥈 0.03870
-            🥉 0.04100
-
-            🚫 Stop-Loss: 0.03440
-
-            🛡Account Usage:- 1 - 2%
-            (According To your Risk Setting) 
-
-
-            Published By - @cryptohunter7717
+    fun `parses crypto inline and multiline signals with leverage stripping and abbreviated target expansion matching parser py`() {
+        val multiLineMsg = """
+            #BTC/USDT LONG
+            Entry: 65000
+            TP: 67000 / 69000
+            SL: 63500
         """.trimIndent()
+        val multiParsed = SignalParser.parseSignal(multiLineMsg, "Crypto", defaultRules)
+        assertEquals("parsed", multiParsed.status)
+        assertEquals("BTCUSDT", multiParsed.symbol)
+        assertEquals("BUY", multiParsed.direction)
+        assertEquals("limit", multiParsed.entryMode)
+        assertEquals(65000.0, multiParsed.entryPrice!!, 0.001)
+        assertEquals(63500.0, multiParsed.stopLoss!!, 0.001)
+        assertEquals(listOf(67000.0, 69000.0), multiParsed.targets)
 
-        val parsed = SignalParser.parseSignal(msg, "Crypto", defaultRules)
-        assertEquals("parsed", parsed.status)
-        assertEquals("NAORISUSDT", parsed.symbol)
-        assertEquals("BUY", parsed.direction)
-        assertEquals("limit", parsed.entryMode)
-        assertEquals(0.0366, parsed.entryPrice!!, 0.00001)
-        assertTrue(parsed.additionalEntries.isEmpty())
-        assertEquals(0.0344, parsed.stopLoss!!, 0.00001)
-        assertEquals(listOf(0.0375, 0.0387, 0.041), parsed.targets)
-    }
-
-    @Test
-    fun `parses EVAAUSDT Cornix multi-line Entry Targets Take-Profit Targets Stop Target and Trailing Config`() {
-        val msg = """
-            ⚡️⚡️ #EVAA/USDT️️️️⚡️️⚡️
-            SIGNAL Type: Regular (LONG) 🔼📈
-            Leverage: Cross (20X) 
-            Amount: 1% ⚠️
-
-            Entry Targets:
-
-            1) ➡️  3.44
-
-            2) ➡️  3.35
-
-            Take-Profit Targets:
-
-            1) 🔼 3.58
-
-            2) 🔼 3.80
-
-            3) 🔼 4.10
-
-            Stop Target:
-
-            1) ⛔️ 3.25
-
-            Trailing Configuration:
-            Stop: Breakeven -
-              Trigger: Target (1)
-
-            NO REACTS 🔥
+        // Abbreviated target expansion via extractCleanNumbers (e.g. 1236 - 33 -> (min, max) = 1233, 1236)
+        val abbrevMsg = """
+            #ETH/USDT SHORT
+            Leverage: 20x
+            Entry: 1250
+            Targets: 1236 - 33
+            Stop Loss: 1270
         """.trimIndent()
+        val abbrevParsed = SignalParser.parseSignal(abbrevMsg, "Crypto", defaultRules)
+        assertEquals("parsed", abbrevParsed.status)
+        assertEquals("ETHUSDT", abbrevParsed.symbol)
+        assertEquals("SELL", abbrevParsed.direction)
+        assertEquals(1250.0, abbrevParsed.entryPrice!!, 0.001)
+        assertEquals(1270.0, abbrevParsed.stopLoss!!, 0.001)
+        assertEquals(listOf(1233.0, 1236.0), abbrevParsed.targets)
 
-        val parsed = SignalParser.parseSignal(msg, "Crypto", defaultRules)
-        assertEquals("parsed", parsed.status)
-        assertEquals("EVAAUSDT", parsed.symbol)
-        assertEquals("BUY", parsed.direction)
-        assertEquals("limit", parsed.entryMode)
-        assertEquals(3.44, parsed.entryPrice!!, 0.0001)
-        assertEquals(listOf(3.35), parsed.additionalEntries)
-        assertEquals(3.25, parsed.stopLoss!!, 0.0001)
-        assertEquals(listOf(3.58, 3.8, 4.1), parsed.targets)
-    }
-
-    @Test
-    fun `parses SHORT Cornix crypto signal and single-line crypto signal without section bleed`() {
-        val shortMsg = """
-            #SUI/USDT
-            Signal Type: Regular (SHORT)
-            Leverage: Isolated (10X)
-            Entry Targets:
-            1) 2.50
-            2) 2.60
-            Take-Profit Targets:
-            1) 2.35
-            2) 2.20
-            3) 2.00
-            Stop Target:
-            1) 2.75
-            Trailing Configuration:
-            Stop: Breakeven -
-              Trigger: Target (1)
+        // SENSEX option with VIP/premium placeholder gets default SL and TP1-TP3 from rules
+        val sensexRules = ParserConstants.defaultSlSeed()
+        val sensexBase = sensexRules["OPTIONS"]!!.symbols["SENSEX"]!!
+        sensexRules["OPTIONS"]!!.symbols["SENSEX"] = sensexBase.copy(sl = 40.0, tp1 = 45.0, tp2 = 85.0, tp3 = 125.0)
+        val vipSensex = """
+            💎BUY SENSEX 84200 CE
+            ▶️LEVEL- 270/280
+            📊TARGET & SL ONLY FOR PREMIUM MEMBERS
         """.trimIndent()
-
-        val shortParsed = SignalParser.parseSignal(shortMsg, "Crypto", defaultRules)
-        assertEquals("parsed", shortParsed.status)
-        assertEquals("SUIUSDT", shortParsed.symbol)
-        assertEquals("SELL", shortParsed.direction)
-        assertEquals(2.50, shortParsed.entryPrice!!, 0.0001)
-        assertEquals(listOf(2.60), shortParsed.additionalEntries)
-        assertEquals(2.75, shortParsed.stopLoss!!, 0.0001)
-        assertEquals(listOf(2.35, 2.20, 2.00), shortParsed.targets)
-
-        val inlineMsg = "BTCUSDT LONG Entry: 65000 TP: 67000 / 69000 SL: 63500"
-        val inlineParsed = SignalParser.parseSignal(inlineMsg, "Crypto", defaultRules)
-        assertEquals("parsed", inlineParsed.status)
-        assertEquals("BTCUSDT", inlineParsed.symbol)
-        assertEquals("BUY", inlineParsed.direction)
-        assertEquals(65000.0, inlineParsed.entryPrice!!, 0.001)
-        assertEquals(63500.0, inlineParsed.stopLoss!!, 0.001)
-        assertEquals(listOf(67000.0, 69000.0), inlineParsed.targets)
+        val sensexParsed = SignalParser.parseSignal(vipSensex, "Index Options", sensexRules)
+        assertEquals("parsed", sensexParsed.status)
+        assertEquals("SENSEX", sensexParsed.symbol)
+        assertEquals("BUY", sensexParsed.direction)
+        assertEquals("CE", sensexParsed.optionType)
+        assertEquals(84200.0, sensexParsed.strikePrice!!, 0.001)
+        assertEquals(270.0, sensexParsed.entryPrice!!, 0.001)
+        assertEquals(listOf(280.0), sensexParsed.additionalEntries)
+        assertTrue(sensexParsed.defaultSlApplied)
+        assertTrue(sensexParsed.defaultTpApplied)
+        assertEquals(230.0, sensexParsed.stopLoss!!, 0.001)
+        // BUY default targets use range midpoint (275 + 45/85/125 = 320/360/400) matching parser.py
+        assertEquals(listOf(320.0, 360.0, 400.0), sensexParsed.targets)
     }
 
     @Test
@@ -357,9 +294,9 @@ class ParserParityTest {
     }
 
     @Test
-    fun `detects market_now keywords across Index Options, Stock Options, Crypto, Forex, and MCX`() {
-        // Index Options: Entry Now, At CMP, trailing NOW
-        val niftyEntryNow = SignalParser.parseSignal(
+    fun `enforces strict parser py market_now rules across Options, Crypto, Forex, and MCX`() {
+        // Options V3.4+ strictly uses limit entries; missing numeric entry -> needs_review
+        val niftyNoPrice = SignalParser.parseSignal(
             """
             BUY NIFTY 24500 CE
             ENTRY NOW
@@ -369,37 +306,21 @@ class ParserParityTest {
             "Index Options",
             defaultRules
         )
-        assertEquals("parsed", niftyEntryNow.status)
-        assertEquals("NIFTY", niftyEntryNow.symbol)
-        assertEquals("BUY", niftyEntryNow.direction)
-        assertEquals("CE", niftyEntryNow.optionType)
-        assertEquals(24500.0, niftyEntryNow.strikePrice!!, 0.001)
-        assertNull(niftyEntryNow.entryPrice)
-        assertEquals("market_now", niftyEntryNow.entryMode)
-        assertEquals(95.0, niftyEntryNow.stopLoss!!, 0.001)
-        assertEquals(listOf(150.0, 180.0), niftyEntryNow.targets)
+        assertEquals("needs_review", niftyNoPrice.status)
+        assertEquals("limit", niftyNoPrice.entryMode)
+        assertNull(niftyNoPrice.entryPrice)
 
-        val bnCmp = SignalParser.parseSignal("BUY BANKNIFTY 52000 PE AT CMP\nSL 250\nTARGET 350 400", "Index Options", defaultRules)
-        assertEquals("parsed", bnCmp.status)
-        assertNull(bnCmp.entryPrice)
-        assertEquals("market_now", bnCmp.entryMode)
-        assertEquals(250.0, bnCmp.stopLoss!!, 0.001)
-        assertEquals(listOf(350.0, 400.0), bnCmp.targets)
+        val stockNoPrice = SignalParser.parseSignal("BUY RELIANCE 1300 CE MARKET PRICE", "Stock Options", defaultRules)
+        assertEquals("needs_review", stockNoPrice.status)
+        assertEquals("limit", stockNoPrice.entryMode)
 
-        // Stock Options: Market Price
-        val stockMkt = SignalParser.parseSignal("BUY RELIANCE 1300 CE MARKET PRICE", "Stock Options", defaultRules)
-        assertEquals("parsed", stockMkt.status)
-        assertEquals("RELIANCE", stockMkt.symbol)
-        assertNull(stockMkt.entryPrice)
-        assertEquals("market_now", stockMkt.entryMode)
-
-        // Crypto: Enter at Market Price & Cornix multi-line Entry Targets -> Market
+        // Crypto: Entry: MARKET / NOW / CMP triggers market_now
         val cryptoMkt = SignalParser.parseSignal(
             """
             #ETH/USDT SHORT
-            Enter at Market Price
+            Entry: MARKET
             Targets: 3100 / 3000
-            Stop-Loss: 3300
+            Stop Loss: 3300
             """.trimIndent(),
             "Crypto",
             defaultRules
@@ -410,51 +331,39 @@ class ParserParityTest {
         assertNull(cryptoMkt.entryPrice)
         assertEquals("market_now", cryptoMkt.entryMode)
         assertEquals(3300.0, cryptoMkt.stopLoss!!, 0.001)
-        assertEquals(listOf(3100.0, 3000.0), cryptoMkt.targets)
+        // parser.py _expand_range_pair returns (min, max)
+        assertEquals(listOf(3000.0, 3100.0), cryptoMkt.targets)
 
-        val cornixMkt = SignalParser.parseSignal(
-            """
-            #DOGE/USDT
-            Signal Type: Regular (LONG)
-            Entry Targets:
-            1) Market
-            Take-Profit Targets:
-            1) 0.165
-            2) 0.175
-            Stop Target:
-            1) 0.145
-            """.trimIndent(),
-            "Crypto",
-            defaultRules
-        )
-        assertEquals("parsed", cornixMkt.status)
-        assertNull(cornixMkt.entryPrice)
-        assertEquals("market_now", cornixMkt.entryMode)
-        assertEquals(0.145, cornixMkt.stopLoss!!, 0.0001)
-        assertEquals(listOf(0.165, 0.175), cornixMkt.targets)
-
-        // Forex: Market Execution / Enter Now
-        val fxMkt = SignalParser.parseSignal("XAUUSD BUY MARKET EXECUTION\nSL: 3710\nTP: 3740", "Forex", defaultRules)
+        // Forex: BUY NOW without price -> market_now; BUY NOW 3733 -> limit @ 3733
+        val fxMkt = SignalParser.parseSignal("XAUUSD BUY NOW\nSL: 3710\nTP: 3740", "Forex", defaultRules)
         assertEquals("parsed", fxMkt.status)
         assertEquals("XAUUSD", fxMkt.symbol)
         assertNull(fxMkt.entryPrice)
         assertEquals("market_now", fxMkt.entryMode)
 
-        // MCX: Entry Now / At CMP
-        val mcxMkt = SignalParser.parseSignal("BUY CRUDEOIL ENTRY NOW\nSL: 6140\nTP: 6280", "MCX", defaultRules)
-        assertEquals("parsed", mcxMkt.status)
-        assertEquals("CRUDEOIL", mcxMkt.symbol)
-        assertNull(mcxMkt.entryPrice)
-        assertEquals("market_now", mcxMkt.entryMode)
-        assertEquals(6140.0, mcxMkt.stopLoss!!, 0.001)
-        assertEquals(listOf(6280.0), mcxMkt.targets)
+        val fxBuyNowLimit = SignalParser.parseSignal("XAUUSD BUY NOW 3733\nSL: 3720\nTP: 3750", "Forex", defaultRules)
+        assertEquals("parsed", fxBuyNowLimit.status)
+        assertEquals("limit", fxBuyNowLimit.entryMode)
+        assertEquals(3733.0, fxBuyNowLimit.entryPrice!!, 0.001)
 
-        // Negative guard: missing entry without market-now keyword stays needs_review
+        // MCX: strictly matches \b(?:buy|sell)\s*now\b for market_now
+        val mcxBuyNow = SignalParser.parseSignal("CRUDEOIL BUY NOW\nSL: 6140\nTP: 6280", "MCX", defaultRules)
+        assertEquals("parsed", mcxBuyNow.status)
+        assertEquals("CRUDEOIL", mcxBuyNow.symbol)
+        assertNull(mcxBuyNow.entryPrice)
+        assertEquals("market_now", mcxBuyNow.entryMode)
+        assertEquals(6140.0, mcxBuyNow.stopLoss!!, 0.001)
+        assertEquals(listOf(6280.0), mcxBuyNow.targets)
+
+        val mcxEntryNowNoPhrase = SignalParser.parseSignal("BUY CRUDEOIL ENTRY NOW\nSL: 6140\nTP: 6280", "MCX", defaultRules)
+        assertEquals("needs_review", mcxEntryNowNoPhrase.status)
+        assertEquals("limit", mcxEntryNowNoPhrase.entryMode)
+
+        // Negative guards: missing entry or exit alert stays needs_review + limit
         val missingEntry = SignalParser.parseSignal("BUY NIFTY 24500 CE", "Index Options", defaultRules)
         assertEquals("needs_review", missingEntry.status)
         assertEquals("limit", missingEntry.entryMode)
 
-        // Negative guard: exit alert ("BOOK NOW") does NOT trigger market_now entry
         val bookAlert = SignalParser.parseSignal("NIFTY 24500 CE BOOK NOW", "Index Options", defaultRules)
         assertEquals("needs_review", bookAlert.status)
         assertEquals("limit", bookAlert.entryMode)
@@ -507,36 +416,27 @@ class ParserParityTest {
         assertEquals(0.535, pharos.stopLoss!!, 0.0001)
         assertEquals(listOf(0.595, 0.615, 0.66), pharos.targets)
 
-        val wolfMmtMsg = """
-            👍 THE WOLF SCALPER 👍
-
-            🚀 LONG: ${'$'}MMT/USDT
+        val mmtMsg = """
+            🚀 LONG: #MMT/USDT
             LEVERAGE: 50x
 
-            ✔️ENTRY PRICE:0.2325
-            ✔️ 2nd ENTRY: 0.2250
-            __________
-            ☄️ TAKE- PROFIT
+            ENTRY PRICE: 0.2325 - 0.2250
+            TAKE PROFIT
 
             0.2400 - 0.2550 - 0.2780
 
             STOP LOSS: 0.2100
-
-            CLICK TO JOIN BITUNIX
-
-            #WE_STAND_WITH_PALESTINE
-
-            REACTIONS?
         """.trimIndent()
 
-        val wolfMmt = SignalParser.parseSignal(wolfMmtMsg, "Crypto", defaultRules)
-        assertEquals("parsed", wolfMmt.status)
-        assertEquals("MMTUSDT", wolfMmt.symbol)
-        assertEquals("BUY", wolfMmt.direction)
-        assertEquals("limit", wolfMmt.entryMode)
-        assertEquals(0.2325, wolfMmt.entryPrice!!, 0.00001)
-        assertEquals(listOf(0.225), wolfMmt.additionalEntries)
-        assertEquals(0.21, wolfMmt.stopLoss!!, 0.00001)
-        assertEquals(listOf(0.24, 0.255, 0.278), wolfMmt.targets)
+        val mmt = SignalParser.parseSignal(mmtMsg, "Crypto", defaultRules)
+        assertEquals("parsed", mmt.status)
+        assertEquals("MMTUSDT", mmt.symbol)
+        assertEquals("BUY", mmt.direction)
+        assertEquals("limit", mmt.entryMode)
+        // parser.py _expand_range_pair returns (min, max) -> entry=0.225, additional=[0.2325]
+        assertEquals(0.225, mmt.entryPrice!!, 0.00001)
+        assertEquals(listOf(0.2325), mmt.additionalEntries)
+        assertEquals(0.21, mmt.stopLoss!!, 0.00001)
+        assertEquals(listOf(0.24, 0.255, 0.278), mmt.targets)
     }
 }

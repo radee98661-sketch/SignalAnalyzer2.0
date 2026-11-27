@@ -598,7 +598,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun refreshSettings() = viewModelScope.launch(Dispatchers.IO) {
         _settings.value = repo.getSettings()
-        _defaultSlRules.value = repo.getDefaultSlRules()
+        _defaultSlRules.value = repo.getDefaultSlRulesWithRecordedSymbols()
     }
 
     fun saveSettings(values: Map<String, String>) = viewModelScope.launch(Dispatchers.IO) {
@@ -609,7 +609,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun saveDefaultSlRules(rules: Map<String, DefaultSlCategoryRule>) = viewModelScope.launch(Dispatchers.IO) {
         repo.saveDefaultSlRules(rules)
-        _defaultSlRules.value = repo.getDefaultSlRules()
+        _defaultSlRules.value = repo.getDefaultSlRulesWithRecordedSymbols()
         _statusMessage.value = "Default SL, TP1–TP3, and position sizing rules saved."
     }
 

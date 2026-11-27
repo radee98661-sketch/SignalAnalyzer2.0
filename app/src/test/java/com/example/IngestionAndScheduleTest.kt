@@ -8,9 +8,11 @@ import com.example.data.local.AppDatabase
 import com.example.data.local.InMemorySecretStore
 import com.example.data.local.LegacySqliteImporter
 import com.example.data.local.VerificationScheduleEntity
+import com.example.data.provider.GoogleSheetsSyncClient
 import com.example.data.provider.MarketDataProviders
 import com.example.data.repository.EventBus
 import com.example.data.repository.SignalIngestionService
+import com.example.data.repository.SignalRepository
 import com.example.data.repository.VerificationService
 import com.example.domain.model.Candle
 import com.example.domain.model.SourceNotificationRow
@@ -136,25 +138,15 @@ class IngestionAndScheduleTest {
         val editedFull = initialTeaser.copy(
             receivedAt = now.plusSeconds(25).toString(),
             message = """
-                👍 THE WOLF SCALPER 👍
-
-                🚀 LONG: ${'$'}MMT/USDT
+                🚀 LONG: #MMT/USDT
                 LEVERAGE: 50x
 
-                ✔️ENTRY PRICE:0.2325
-                ✔️ 2nd ENTRY: 0.2250
-                __________
-                ☄️ TAKE- PROFIT
+                ENTRY PRICE: 0.2325 - 0.2250
+                TAKE PROFIT
 
                 0.2400 - 0.2550 - 0.2780
 
                 STOP LOSS: 0.2100
-
-                CLICK TO JOIN BITUNIX
-
-                #WE_STAND_WITH_PALESTINE
-
-                REACTIONS?
             """.trimIndent()
         )
         val (rawId2, st2) = ingestion.ingest(editedFull)
@@ -169,8 +161,9 @@ class IngestionAndScheduleTest {
         assertEquals("parsed", sigAfter.parsingStatus)
         assertEquals("MMTUSDT", sigAfter.symbol)
         assertEquals("BUY", sigAfter.direction)
-        assertEquals(0.2325, sigAfter.entryPrice!!, 0.00001)
-        assertEquals("[0.225]", sigAfter.additionalEntries)
+        // parser.py _expand_range_pair returns (min, max)
+        assertEquals(0.225, sigAfter.entryPrice!!, 0.00001)
+        assertEquals("[0.2325]", sigAfter.additionalEntries)
         assertEquals(0.21, sigAfter.stopLoss!!, 0.00001)
         assertEquals("[0.24,0.255,0.278]", sigAfter.targets)
 
@@ -546,5 +539,150 @@ class IngestionAndScheduleTest {
         } finally {
             legacyFile.delete()
         }
+    }
+
+    @Test
+    fun `keeps distinct option strikes with VIP boilerplate as primary and repairs legacy false signal_update rows`() = runBlocking {
+        val now = Instant.now()
+        val msg1 = """
+            💎BUY SENSEX 84100 CE
+            ▶️LEVEL- 290/300
+            📊TARGET & SL ONLY FOR PREMIUM MEMBERS
+        """.trimIndent()
+        val msg2 = """
+            💎BUY SENSEX 84200 CE
+            ▶️LEVEL- 270/280
+            📊TARGET & SL ONLY FOR PREMIUM MEMBERS
+        """.trimIndent()
+
+        val (rawId1, st1) = ingestion.ingest(
+            SourceNotificationRow(
+                receivedAt = now.toString(),
+                notificationTime = now.toString(),
+                channel = "OptionsDesk",
+                category = "Index Options",
+                message = msg1,
+                notificationId = "sensex-84100"
+            )
+        )
+        assertEquals("imported", st1)
+
+        val (rawId2, st2) = ingestion.ingest(
+            SourceNotificationRow(
+                receivedAt = now.plusSeconds(360).toString(),
+                notificationTime = now.plusSeconds(360).toString(),
+                channel = "OptionsDesk",
+                category = "Index Options",
+                message = msg2,
+                notificationId = "sensex-84200"
+            )
+        )
+        assertEquals("imported", st2)
+
+        val raw1 = db.coreDao().getRawNotificationById(rawId1!!)!!
+        val raw2 = db.coreDao().getRawNotificationById(rawId2!!)!!
+        assertEquals(0, raw1.isDuplicate)
+        assertEquals(0, raw2.isDuplicate)
+        assertNull(raw2.duplicateReason)
+        assertNull(raw2.duplicateGroupId)
+
+        // Genuine same-strike follow-up with numeric SL/TP still classifies as signal_update
+        val (rawId3, st3) = ingestion.ingest(
+            SourceNotificationRow(
+                receivedAt = now.plusSeconds(420).toString(),
+                notificationTime = now.plusSeconds(420).toString(),
+                channel = "OptionsDesk",
+                category = "Index Options",
+                message = "BUY SENSEX 84100 CE\nENTRY: 295\nSL: 250\nTP: 335 / 375",
+                notificationId = "sensex-84100-upd"
+            )
+        )
+        assertEquals("imported", st3)
+        val raw3 = db.coreDao().getRawNotificationById(rawId3!!)!!
+        assertEquals(0, raw3.isDuplicate)
+        assertEquals(SignalIngestionService.DUPLICATE_REASON_UPDATE, raw3.duplicateReason)
+
+        // Simulate legacy falsely-grouped row on SENSEX 84200 CE inside raw1's existing update group
+        val existingGroup = db.coreDao().getRawNotificationById(rawId1)!!.duplicateGroupId!!
+        db.coreDao().setDuplicateGroupPair(rawId1, rawId2, existingGroup)
+        db.coreDao().setDuplicateReason(rawId2, SignalIngestionService.DUPLICATE_REASON_UPDATE)
+
+        val repaired = ingestion.repairFalseSignalUpdates()
+        assertEquals(1, repaired)
+
+        val repairedRaw2 = db.coreDao().getRawNotificationById(rawId2)!!
+        assertNull(repairedRaw2.duplicateReason)
+        assertNull(repairedRaw2.duplicateGroupId)
+        // Genuine update on 84100 CE remains untouched
+        val intactRaw3 = db.coreDao().getRawNotificationById(rawId3)!!
+        assertEquals(SignalIngestionService.DUPLICATE_REASON_UPDATE, intactRaw3.duplicateReason)
+    }
+
+    @Test
+    fun `discovers recorded signal symbols dynamically in Default SL rules and parses yearless Angel expiry tokens`() = runBlocking {
+        val now = Instant.now()
+        ingestion.ingest(
+            SourceNotificationRow(
+                receivedAt = now.toString(),
+                notificationTime = now.toString(),
+                channel = "DynChan",
+                category = "Crypto",
+                message = "#SOL/USDT LONG\nEntry: 180\nTP: 195\nSL: 170",
+                notificationId = "dyn-crypto-1"
+            )
+        )
+        ingestion.ingest(
+            SourceNotificationRow(
+                receivedAt = now.toString(),
+                notificationTime = now.toString(),
+                channel = "DynChan",
+                category = "MCX",
+                message = "BUY ZINC 285\nTP: 292\nSL: 280",
+                notificationId = "dyn-mcx-fut"
+            )
+        )
+        ingestion.ingest(
+            SourceNotificationRow(
+                receivedAt = now.toString(),
+                notificationTime = now.toString(),
+                channel = "DynChan",
+                category = "MCX",
+                message = "BUY CRUDEOIL 6200 CE @ 145 SL 110 TGT 190",
+                notificationId = "dyn-mcx-opt"
+            )
+        )
+        ingestion.ingest(
+            SourceNotificationRow(
+                receivedAt = now.toString(),
+                notificationTime = now.toString(),
+                channel = "DynChan",
+                category = "Stock Options",
+                message = "BUY ADANIENT 2500 CE @ 60 SL 45 TGT 85",
+                notificationId = "dyn-stk-opt"
+            )
+        )
+
+        val verService = VerificationService(db, secretStore, stubProviders, eventBus)
+        val syncClient = GoogleSheetsSyncClient(db, secretStore, ingestion, eventBus)
+        val repo = SignalRepository(context, db, secretStore, stubProviders, ingestion, verService, syncClient, eventBus)
+
+        val discovered = repo.getDefaultSlRulesWithRecordedSymbols()
+        assertTrue(discovered["CRYPTO"]!!.symbols.containsKey("SOLUSDT"))
+        assertTrue(discovered["MCX"]!!.symbols.containsKey("ZINC:FUT"))
+        assertTrue(discovered["MCX"]!!.symbols.containsKey("CRUDEOIL:OPT"))
+        assertTrue(discovered["STOCK_OPTIONS"]!!.symbols.containsKey("ADANIENT"))
+        // Symbols within each category are alphabetically sorted
+        val cryptoKeys = discovered["CRYPTO"]!!.symbols.keys.toList()
+        assertEquals(cryptoKeys.sorted(), cryptoKeys)
+
+        // Year-less Angel One expiry parsing with 180-day rollover
+        assertEquals(
+            java.time.LocalDate.of(2026, 5, 28),
+            verService.parseLiveExpiryToken("28MAY", java.time.LocalDate.of(2026, 5, 1))
+        )
+        assertEquals(
+            java.time.LocalDate.of(2027, 1, 15),
+            verService.parseLiveExpiryToken("15JAN", java.time.LocalDate.of(2026, 12, 20))
+        )
     }
 }

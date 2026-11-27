@@ -30,6 +30,8 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
+import java.time.format.DateTimeFormatterBuilder
+import java.time.temporal.ChronoField
 import java.util.Locale
 import kotlin.math.abs
 
@@ -109,19 +111,34 @@ class VerificationService(
     private fun parseMasterExpiry(exp: String?): LocalDate? {
         if (exp.isNullOrBlank()) return null
         val clean = exp.trim().uppercase(Locale.US)
-        val fmts = listOf(
-            DateTimeFormatter.ofPattern("ddMMMyyyy", Locale.US),
-            DateTimeFormatter.ofPattern("ddMMMyy", Locale.US),
-            DateTimeFormatter.ofPattern("yyyy-MM-dd", Locale.US),
-            DateTimeFormatter.ofPattern("dd-MMM-yyyy", Locale.US)
-        )
-        for (f in fmts) {
+        val patterns = listOf("dMMMyyyy", "dMMMyy", "yyyy-MM-dd", "d-MMM-yyyy")
+        for (p in patterns) {
             try {
-                return LocalDate.parse(clean, f)
+                val fmt = DateTimeFormatterBuilder()
+                    .parseCaseInsensitive()
+                    .appendPattern(p)
+                    .toFormatter(Locale.US)
+                return LocalDate.parse(clean, fmt)
             } catch (_: Exception) {
             }
         }
         return null
+    }
+
+    internal fun parseLiveExpiryToken(expToken: String, refDate: LocalDate): LocalDate {
+        parseMasterExpiry(expToken)?.let { return it }
+        val clean = expToken.trim().uppercase(Locale.US)
+        try {
+            val fmt = DateTimeFormatterBuilder()
+                .parseCaseInsensitive()
+                .appendPattern("dMMM")
+                .parseDefaulting(ChronoField.YEAR, refDate.year.toLong())
+                .toFormatter(Locale.US)
+            val dt = LocalDate.parse(clean, fmt)
+            return if (dt.isBefore(refDate.minusDays(180))) dt.plusYears(1) else dt
+        } catch (_: Exception) {
+        }
+        return refDate
     }
 
     private suspend fun maybeRefreshAngelMaster(): Boolean {
@@ -332,7 +349,7 @@ class VerificationService(
                 expToken = m.groupValues[2]
             }
 
-            val expDate = parseMasterExpiry(expToken) ?: refDate
+            val expDate = parseLiveExpiryToken(expToken, refDate)
             val hintMatch = hintExpiry.isNotEmpty() && hintExpiry in expToken
             scored += ScoredHit(hintMatch, !expDate.isBefore(refDate), expDate, exch, tok, rawTsym)
         }
@@ -825,7 +842,7 @@ class VerificationService(
         // Lock in market_now entry price from first candle open
         if (entryMode == "market_now" && entryPrice == null && candles.isNotEmpty()) {
             val firstC = candles.first()
-            val marketEntry = firstC.open
+            val marketEntry = firstC.open.takeIf { it > 0.0 } ?: firstC.close
             entryPrice = marketEntry
             var expl = record.parsingExplanation.orEmpty()
             val note = "Market entry @ ${DefaultRulesEngine.formatG(marketEntry)} (${firstC.candleTimestamp})"

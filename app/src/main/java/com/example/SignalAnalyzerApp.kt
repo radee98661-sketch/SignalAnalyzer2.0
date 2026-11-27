@@ -81,6 +81,7 @@ class SignalAnalyzerApp : Application() {
             try {
                 container.db.initializeDefaults()
                 container.backgroundHealthTracker.ensureLoaded()
+                container.ingestionService.repairFalseSignalUpdates()
                 container.verificationService.reconcileOnStartup()
             } catch (_: Exception) {
             }

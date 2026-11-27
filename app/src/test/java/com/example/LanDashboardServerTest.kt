@@ -165,6 +165,22 @@ class LanDashboardServerTest {
         parseResp.close()
         assertEquals("BTCUSDT", parseJson.getString("symbol"))
         assertEquals("BUY", parseJson.getString("direction"))
+        assertFalse(parseJson.has("split_signals"))
+
+        // 4b. Multi-signal parse returns split_signals alongside signals
+        val multiParseResp = client.newCall(
+            Request.Builder()
+                .url("$baseUrl/api/v1/parse")
+                .header("Authorization", "Bearer $sessionToken")
+                .header("X-Requested-With", "SignalAnalyzer")
+                .post("""{"category":"Forex","message":"EURUSD BUY 1.0850\nTP: 1.0900\nSL: 1.0810\n\nGBPUSD SELL 1.2750\nTP: 1.2690\nSL: 1.2800"}""".toRequestBody(jsonMedia))
+                .build()
+        ).execute()
+        assertEquals(200, multiParseResp.code)
+        val multiParseJson = JSONObject(multiParseResp.body!!.string())
+        multiParseResp.close()
+        assertEquals(2, multiParseJson.getInt("signal_count"))
+        assertEquals(2, multiParseJson.getJSONArray("split_signals").length())
 
         // 5. Import manual signal via API (with all 10 required SOURCE_COLUMNS)
         val nowIso = TimeUtils.utcNowIso()

@@ -30,43 +30,6 @@ object HybridOptionsParser {
     private val SPACES_RE = Regex("[ \\t]+")
     private val NUMBER_RE = Regex("[0-9,]+(?:\\.[0-9]+)?")
 
-    val MARKET_NOW_SEGMENT_RE = Regex(
-        "\\b(?:now|right\\s+now|market(?:\\s+(?:price|order|execution|rate|entry))?|at\\s+market|cmp|at\\s+cmp|current(?:\\s+market)?\\s+price|live(?:\\s+price)?|instant(?:\\s+(?:execution|entry))?|running(?:\\s+price)?|spot(?:\\s+price)?)\\b",
-        RegexOption.IGNORE_CASE
-    )
-
-    val MARKET_NOW_PHRASE_RE = Regex(
-        "(?:" +
-            "\\b(?:take\\s+)?(?:entry|enter|entries|entrys|entry[\\s\\-]*(?:price|zone|level|targets?))[ \\t]*[:=\\-]?[ \\t]*(?:at[ \\t]+|@[ \\t]*)?(?:now|right\\s+now|market(?:\\s+(?:price|order|execution|rate))?|cmp|current(?:\\s+market)?\\s+price|live(?:\\s+price)?|instant(?:\\s+execution)?|running(?:\\s+price)?|spot(?:\\s+price)?)\\b" +
-            "|\\b(?:buy|sell|long|short)[ \\t]*[:=\\-]?[ \\t]*(?:at[ \\t]+|@[ \\t]*)?(?:now|right\\s+now|market(?:\\s+(?:price|order|execution|rate))?|cmp|current(?:\\s+market)?\\s+price|live(?:\\s+price)?|instant(?:ly)?)\\b" +
-            "|\\b(?:market|instant)[ \\t]+(?:buy|sell|long|short|entry|order|execution)\\b" +
-            "|\\b(?:at|@)[ \\t]*(?:market(?:\\s+price)?|cmp|current(?:\\s+market)?\\s+price|live(?:\\s+price)?)\\b" +
-            "|\\b(?:current\\s+market\\s+price|market\\s+price|live\\s+price|enter\\s+now|entry\\s+now|right\\s+now)\\b" +
-        ")",
-        RegexOption.IGNORE_CASE
-    )
-
-    private val EXPLICIT_MARKET_ENTRY_LINE_RE = Regex(
-        "(?:" +
-            "\\b(?:take\\s+)?(?:entry|enter|entries|entrys|entry[\\s\\-]*(?:price|zone|level|targets?))[ \\t]*[:=\\-]?[ \\t]*(?:at[ \\t]+|@[ \\t]*)?(?:now|right\\s+now|market(?:\\s+(?:price|order|execution|rate))?|cmp|current(?:\\s+market)?\\s+price|live(?:\\s+price)?|instant(?:\\s+execution)?|running(?:\\s+price)?|spot(?:\\s+price)?)" +
-            "|\\b(?:at|@)[ \\t]*(?:market(?:\\s+price)?|cmp|current(?:\\s+market)?\\s+price|live(?:\\s+price)?)" +
-            "|\\b(?:current\\s+market\\s+price|market\\s+(?:price|order|execution|entry)|instant\\s+(?:execution|entry)|live\\s+price)" +
-            "|\\b(?:buy|sell|long|short)[ \\t]*[:=\\-]?[ \\t]*(?:at[ \\t]+|@[ \\t]*)?(?:now|right\\s+now|market(?:\\s+(?:price|order|execution|rate))?|cmp|current(?:\\s+market)?\\s+price|live(?:\\s+price)?|instant(?:ly)?)" +
-        ")(?=[ \\t]*(?:$|\\n|[.,;()!]))",
-        RegexOption.IGNORE_CASE
-    )
-
-    fun hasMarketNowKeyword(text: String): Boolean {
-        if (MARKET_NOW_PHRASE_RE.containsMatchIn(text)) return true
-        if (Regex("\\bcmp\\b(?![ \\t:=\\-(]*\\d)", RegexOption.IGNORE_CASE).containsMatchIn(text)) return true
-        if (Regex("\\bnow\\b(?![ \\t:=\\-@]*\\d)", RegexOption.IGNORE_CASE).containsMatchIn(text) &&
-            !Regex("\\b(?:from\\s+now|for\\s+now|as\\s+of\\s+now|till\\s+now|until\\s+now|up\\s+now|booked\\s+now|exit\\s+now|close\\s+now|book\\s+now)\\b", RegexOption.IGNORE_CASE).containsMatchIn(text)
-        ) {
-            return true
-        }
-        return false
-    }
-
     fun normalizeText(text: String?): String {
         var s = text.orEmpty()
         s = KEYCAP_RE.replace(s, " ")
@@ -467,7 +430,7 @@ object HybridOptionsParser {
         }
 
         val mainTpRe = Regex(
-            "\\b(?:PREMIUM\\s+)?(?:TARGETS?|TGT|TG|TP)(?:([1-9]|10)(?=\\s*[:=.\\-_@\$]|\\s+\\d))?\\s*[:=.\\-_]{0,4}\\s*[\$@\\s]*((?:(?:[1-9]|10)\\s*[:=.\\-]\\s*)?[\$]?\\s*[0-9,]+(?:\\.[0-9]+)?(?:(?:\\s*(?:[-/,\\n]|AND|TO)\\s*|[ \\t]+)(?:(?:[1-9]|10)\\s*[:=.\\-]\\s*)?[\$]?\\s*[0-9,]+(?:\\.[0-9]+)?)*)\\+*",
+            "\\b(?:PREMIUM\\s+)?(?:TARGETS?|TGT|TG|TP)(?:([1-9]|10)(?=\\s*[:=.\\-_@\$]|\\s+\\d))?\\s*[:=.\\-_]{0,4}\\s*[\$@\\s]*((?:(?:[1-9]|10)\\s*[:=.\\-]\\s*)?[\$]?\\s*[0-9,]+(?:\\.[0-9]+)?(?:\\s*(?:[-/,\\n]|AND|TO)\\s*(?:(?:[1-9]|10)\\s*[:=.\\-]\\s*)?[\$]?\\s*[0-9,]+(?:\\.[0-9]+)?)*)\\+*",
             RegexOption.IGNORE_CASE
         )
         for (m in mainTpRe.findAll(masked).toList()) {
@@ -496,15 +459,6 @@ object HybridOptionsParser {
     private fun extractEntry(workingText: String, optionAnchorEnd: Int): EntryExtractionResult {
         val searchOffset = if (optionAnchorEnd > 0) optionAnchorEnd else 0
         val searchSlice = workingText.substring(searchOffset)
-
-        val explicitMarketM = EXPLICIT_MARKET_ENTRY_LINE_RE.find(workingText)
-        if (explicitMarketM != null) {
-            return EntryExtractionResult(
-                maskSpan(workingText, explicitMarketM.range.first, explicitMarketM.range.last + 1),
-                emptyList(),
-                "MARKET_NOW"
-            )
-        }
 
         var rangeCtx = Regex(
             "\\b(?:ENTRYS?|ENTRY(?:\\s*(?:BUY|SELL|PRICE|RANGE|ZONE|LEVEL))?|BUY\\s*RANGE|SELL\\s*RANGE|BUY\\s*LEVEL|SELL\\s*LEVEL|LEVEL|ZONE|RANGE|BUY|SELL|LONG|SHORT|ABOVE|ABV|BELOW|AT|NEAR(?:\\s*LEVEL)?|CMP|NOW|@)(?:\\s+(?:NOW|CMP|STOP|LIMIT|AT|RANGE|ZONE|LEVEL|TO|ONLY))?(?:\\s+[A-Z][A-Z0-9]{1,11})?\\s*[:=.\\-_@\\$\\s]{0,6}([0-9,]+(?:\\.[0-9]+)?)\\s*(?:[-/_]|TO)\\s*\\$?\\s*([0-9,]+(?:\\.[0-9]+)?)",
@@ -634,11 +588,6 @@ object HybridOptionsParser {
         val entryRes = extractEntry(workingText, optionAnchorEnd)
         workingText = entryRes.masked
         val entries = entryRes.entries
-        val entryMode = if (entries.isEmpty() && (entryRes.conf == "MARKET_NOW" || hasMarketNowKeyword(workingText))) {
-            "market_now"
-        } else {
-            "limit"
-        }
 
         if (pipTargets.isNotEmpty() && entries.isNotEmpty() && direction != null) {
             val baseEntry = entries.sum() / entries.size
@@ -687,7 +636,7 @@ object HybridOptionsParser {
         val errors = mutableListOf<String>()
         if (symbol.isNullOrBlank()) errors += "missing instrument"
         if (direction == null) errors += "missing direction"
-        if (entries.isEmpty() && entryMode != "market_now") errors += "missing entry"
+        if (entries.isEmpty()) errors += "missing entry"
 
         var ambiguous = false
         if (entries.isNotEmpty() && direction != null) {
@@ -718,23 +667,22 @@ object HybridOptionsParser {
         var confidence = 0.15 +
             (if (direction != null) 0.25 else 0.0) +
             (if (!symbol.isNullOrBlank()) 0.25 else 0.0) +
-            (if (entries.isNotEmpty()) 0.20 else if (entryMode == "market_now") 0.16 else 0.0) +
+            (if (entries.isNotEmpty()) 0.20 else 0.0) +
             (if (hasRiskOrTarget) 0.15 else 0.0)
         if (ambiguous) confidence = min(confidence, 0.55)
 
-        val status = if (direction != null && !symbol.isNullOrBlank() && (entries.isNotEmpty() || entryMode == "market_now") && !ambiguous) {
+        val status = if (direction != null && !symbol.isNullOrBlank() && entries.isNotEmpty() && !ambiguous) {
             "parsed"
         } else {
             "needs_review"
         }
 
         val notes = mutableListOf<String>()
-        if (entryMode == "market_now") notes += "entry=market_now"
         if (slStatus != null) notes += "SL=$slStatus"
         if (targetStatus != null) notes += "Targets=$targetStatus"
         if (errors.isNotEmpty()) notes += "Issues: ${errors.joinToString(", ")}"
 
-        val explanation = "V3.4+ hybrid parser (${detectedCat.ifEmpty { "AUTO" }}): extracted direction, symbol/contract, ${if (entryMode == "market_now") "market_now entry" else "entry"}" +
+        val explanation = "V3.4+ hybrid parser (${detectedCat.ifEmpty { "AUTO" }}): extracted direction, symbol/contract, entry" +
             if (notes.isNotEmpty()) " (${notes.joinToString("; ")})" else "."
 
         var result = ParsedSignal(
@@ -748,7 +696,7 @@ object HybridOptionsParser {
             optionType = optionType,
             strikePrice = strikePrice,
             expiryDate = expiryDate,
-            entryMode = entryMode,
+            entryMode = "limit",
             status = status,
             confidence = DefaultRulesEngine.roundValue(confidence, 2),
             review = if (status != "parsed") "required" else "not_required",

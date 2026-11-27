@@ -774,8 +774,12 @@ class LanDashboardServer(
             val rules = repository.getDefaultSlRules()
             val items = SignalParser.parseSignals(message, category, slRules = rules)
             val primaryObj = JsonUtils.parsedSignalToJsonObject(items.first())
-            primaryObj.put("signals", JSONArray(items.map { JsonUtils.parsedSignalToJsonObject(it) }))
+            val allSignalsJson = JSONArray(items.map { JsonUtils.parsedSignalToJsonObject(it) })
+            primaryObj.put("signals", allSignalsJson)
             primaryObj.put("signal_count", items.size)
+            if (items.size > 1) {
+                primaryObj.put("split_signals", JSONArray(items.map { JsonUtils.parsedSignalToJsonObject(it) }))
+            }
             call.respondJson(primaryObj)
         }
 
@@ -803,7 +807,7 @@ class LanDashboardServer(
 
         suspend fun handleGetDefaultSl(call: ApplicationCall) {
             if (!call.requireAuth()) return
-            val rules = repository.getDefaultSlRules()
+            val rules = repository.getDefaultSlRulesWithRecordedSymbols()
             call.respondJson(defaultSlRulesToDashboardJson(rules))
         }
         get("/default-sl") { handleGetDefaultSl(call) }

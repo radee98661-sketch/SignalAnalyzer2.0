@@ -201,6 +201,34 @@ class SignalRepository(
     suspend fun getDefaultSlRules(): MutableMap<String, DefaultSlCategoryRule> =
         DefaultRulesEngine.rulesFromJson(db.coreDao().getSetting("default_sl_rules"))
 
+    suspend fun getDefaultSlRulesWithRecordedSymbols(): MutableMap<String, DefaultSlCategoryRule> {
+        val rules = getDefaultSlRules()
+        val recorded = db.coreDao().getDistinctSignalSymbols()
+        for (rec in recorded) {
+            val sym = rec.symbol?.trim()?.uppercase(Locale.US).orEmpty()
+            if (sym.isEmpty()) continue
+            val cat = DefaultRulesEngine.normalizeSlCategory(rec.category, sym, rec.optionType)
+            val block = rules.getOrPut(cat) { DefaultSlCategoryRule() }
+            val key = if (cat == "MCX") {
+                "$sym:${if (!rec.optionType.isNullOrBlank()) "OPT" else "FUT"}"
+            } else {
+                sym
+            }
+            if (!block.symbols.containsKey(key)) {
+                block.symbols[key] = DefaultSlSymbolRule()
+            }
+        }
+        val sorted = linkedMapOf<String, DefaultSlCategoryRule>()
+        for ((cat, block) in rules) {
+            val sortedSymbols = linkedMapOf<String, DefaultSlSymbolRule>()
+            block.symbols.keys.sorted().forEach { k ->
+                block.symbols[k]?.let { sortedSymbols[k] = it }
+            }
+            sorted[cat] = block.copy(symbols = sortedSymbols)
+        }
+        return sorted
+    }
+
     suspend fun saveDefaultSlRules(rules: Map<String, DefaultSlCategoryRule>) {
         val now = TimeUtils.utcNowIso()
         db.coreDao().upsertSetting(ApplicationSettingEntity("default_sl_rules", DefaultRulesEngine.rulesToJson(rules), now))

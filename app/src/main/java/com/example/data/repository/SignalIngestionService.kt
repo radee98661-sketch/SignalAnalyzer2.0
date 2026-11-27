@@ -254,7 +254,7 @@ class SignalIngestionService(
             val related = mutableListOf<RawNotificationEntity>()
             val incomingNorm = normalizedMessage(row.message)
             val incomingSubject = messageSubject(row.message)
-            val hasDetailMarkers = DETAIL_MARKERS.containsMatchIn(row.message)
+            val hasDetailMarkers = hasUpdateDetailMarkers(row.message)
 
             for (cand in candidates) {
                 val candTime = TimeUtils.notificationInstant(cand.notificationTime, cand.receivedAt)
@@ -419,7 +419,64 @@ class SignalIngestionService(
         return result
     }
 
+    suspend fun repairFalseSignalUpdates(): Int {
+        val nowIso = TimeUtils.utcNowIso()
+        val repaired = db.withTransaction {
+            val core = db.coreDao()
+            val flagged = core.getSignalUpdateRawNotifications()
+            if (flagged.isEmpty()) return@withTransaction 0
+
+            val affectedGroups = linkedSetOf<String>()
+            var fixedCount = 0
+
+            for (row in flagged) {
+                val hasMarkers = hasUpdateDetailMarkers(row.message)
+                val rowSubj = messageSubject(row.message)
+                val groupId = row.duplicateGroupId
+                val matchesPeerInGroup = if (hasMarkers && rowSubj.first != null && !groupId.isNullOrBlank()) {
+                    val peers = core.getRawNotificationsByGroupId(groupId).filter { it.id != row.id }
+                    peers.any { peer -> messageSubject(peer.message) == rowSubj }
+                } else {
+                    false
+                }
+
+                if (!matchesPeerInGroup) {
+                    core.clearFalseSignalUpdate(row.id)
+                    if (!groupId.isNullOrBlank()) affectedGroups += groupId
+                    fixedCount++
+                }
+            }
+
+            for (gid in affectedGroups) {
+                val remaining = core.getRawNotificationsByGroupId(gid)
+                if (remaining.size == 1) {
+                    val only = remaining.first()
+                    if (only.isDuplicate == 0 && only.duplicateReason.isNullOrBlank()) {
+                        core.clearOrphanDuplicateGroup(only.id)
+                    }
+                }
+            }
+
+            if (fixedCount > 0) {
+                core.insertSystemLog(
+                    SystemLogEntity(
+                        createdAt = nowIso,
+                        severity = "INFO",
+                        source = "ingest",
+                        message = "Repaired $fixedCount falsely grouped signal_update notification(s)"
+                    )
+                )
+            }
+            fixedCount
+        }
+        if (repaired > 0) {
+            eventBus.emit(AppEvent("signal.changed", null, "signal_updates_repaired", "count=$repaired", nowIso))
+        }
+        return repaired
+    }
+
     suspend fun backfillDuplicateClassifications() {
+        repairFalseSignalUpdates()
         db.withTransaction {
             val core = db.coreDao()
             val window = core.getSetting("duplicate_window_minutes")?.toDoubleOrNull() ?: 10.0
@@ -431,7 +488,7 @@ class SignalIngestionService(
                 val related = mutableListOf<RawNotificationEntity>()
                 val subject = messageSubject(row.message)
                 val norm = normalizedMessage(row.message)
-                val hasMarkers = DETAIL_MARKERS.containsMatchIn(row.message.orEmpty())
+                val hasMarkers = hasUpdateDetailMarkers(row.message)
                 for (cand in candidates) {
                     val candTime = TimeUtils.notificationInstant(cand.notificationTime, cand.receivedAt)
                     if (abs(Duration.between(currentTime, candTime).seconds) > window * 60.0) continue
@@ -465,19 +522,71 @@ class SignalIngestionService(
         const val DUPLICATE_REASON_EXACT = "same normalized message from same channel within configured window"
         const val DUPLICATE_REASON_UPDATE = "signal_update: richer same-channel message with entries, targets, stop loss, or leverage"
 
-        val DETAIL_MARKERS = Regex(
-            "\\b(?:ENTRY|ENTRIES|TARGETS?|TP\\d*|SL|STOP\\s*LOSS|LEVERAGE)\\b|\\b\\d+(?:\\.\\d+)?X\\b",
+        private val PREMIUM_PLACEHOLDER_LINE_RE = Regex(
+            "(?:\\b(?:TARGETS?|TP\\d*|SL|STOP\\s*LOSS|ENTRY|ENTRIES)\\b[^\\n]*\\b(?:ONLY\\s+FOR|PREMIUM|PAID|VIP|MEMBERS?|GROUP|CHANNEL|OPEN|COMING\\s+SOON|WILL\\s+UPDATE|SOON)\\b[^\\n]*)",
             RegexOption.IGNORE_CASE
         )
+
+        val DETAIL_MARKERS = Regex(
+            "\\b(?:ENTRY|ENTRIES|TARGETS?|TP\\d*|SL|STOP\\s*LOSS|LEVERAGE)\\b\\s*[:=\\-–—@]*\\s*(?:\\n\\s*)?(?:\\d+\\s*[).:]\\s*)?\\d+(?:\\.\\d+)?|\\b\\d+(?:\\.\\d+)?\\s*X\\b",
+            RegexOption.IGNORE_CASE
+        )
+
+        private val INDEX_OPTION_SUBJECT_RE = Regex(
+            "\\b(NIFTY|BANKNIFTY|FINNIFTY|MIDCPNIFTY|SENSEX|BANKEX)\\b(?:\\s+\\d{1,2}\\s*[A-Z]{3,9}(?:\\s*\\d{2,4})?)?\\s+(\\d{3,6}(?:\\.\\d+)?)\\s*(CE|PE|CALL|PUT)\\b"
+        )
+
+        private val GENERIC_OPTION_SUBJECT_RE = Regex(
+            "\\b([A-Z][A-Z0-9&]{1,14})\\b(?:\\s+\\d{1,2}\\s*[A-Z]{3,9}(?:\\s*\\d{2,4})?)?\\s+(\\d{2,6}(?:\\.\\d+)?)\\s*(CE|PE|CALL|PUT)\\b"
+        )
+
+        private val OPTION_SUBJECT_STOP_WORDS = setOf(
+            "BUY", "SELL", "LONG", "SHORT", "AT", "CMP", "ABOVE", "BELOW", "NEAR", "AROUND",
+            "LEVEL", "LEVELS", "ENTRY", "ENTRIES", "TARGET", "TARGETS", "SL", "STOP", "LOSS",
+            "ONLY", "FOR", "PREMIUM", "MEMBERS", "PAID", "VIP", "IN", "ON", "THE", "OF",
+            "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"
+        )
+
+        private val BASE_SYMBOL_SUBJECT_RE = Regex(
+            "\\b[A-Z0-9]+[_/]?USDT\\b|\\b(?:NIFTY|BANKNIFTY|FINNIFTY|MIDCPNIFTY|SENSEX|BANKEX|GOLD|SILVER|CRUDEOIL|NATURALGAS|XAUUSD|XAGUSD|EURUSD|GBPUSD|USDJPY|GBPJPY|AUDUSD|USDCAD|USDCHF|NZDUSD|EURGBP|EURJPY|US30|NAS100)\\b"
+        )
+
+        fun hasUpdateDetailMarkers(value: String?): Boolean {
+            if (value.isNullOrBlank()) return false
+            val cleaned = PREMIUM_PLACEHOLDER_LINE_RE.replace(value, " ")
+            return DETAIL_MARKERS.containsMatchIn(cleaned)
+        }
 
         fun normalizedMessage(value: String?): String =
             Regex("\\s+").replace(Regex("[^A-Z0-9]+").replace((value ?: "").uppercase(Locale.US), " "), " ").trim()
 
+        private fun normalizeStrikeToken(raw: String): String {
+            val d = raw.toDoubleOrNull() ?: return raw
+            return if (d == d.toLong().toDouble()) d.toLong().toString() else raw
+        }
+
         fun messageSubject(value: String?): Pair<String?, String?> {
             val text = (value ?: "").uppercase(Locale.US)
-            val symbol = Regex("\\b[A-Z0-9]+[_/]?USDT\\b|\\b(?:NIFTY|BANKNIFTY|SENSEX|GOLD|SILVER|CRUDEOIL|XAUUSD)\\b").find(text)
-            val direction = Regex("\\b(?:BUY|SELL|LONG|SHORT)\\b").find(text)
-            return symbol?.value?.replace("_", "")?.replace("/", "") to direction?.value
+            val direction = Regex("\\b(?:BUY|SELL|LONG|SHORT)\\b").find(text)?.value
+
+            val idxOpt = INDEX_OPTION_SUBJECT_RE.find(text)
+            if (idxOpt != null) {
+                val base = idxOpt.groupValues[1]
+                val strike = normalizeStrikeToken(idxOpt.groupValues[2])
+                val optType = if (idxOpt.groupValues[3] in setOf("CE", "CALL")) "CE" else "PE"
+                return "$base:$strike:$optType" to direction
+            }
+
+            for (m in GENERIC_OPTION_SUBJECT_RE.findAll(text)) {
+                val candidate = m.groupValues[1]
+                if (candidate in OPTION_SUBJECT_STOP_WORDS) continue
+                val strike = normalizeStrikeToken(m.groupValues[2])
+                val optType = if (m.groupValues[3] in setOf("CE", "CALL")) "CE" else "PE"
+                return "$candidate:$strike:$optType" to direction
+            }
+
+            val symbol = BASE_SYMBOL_SUBJECT_RE.find(text)
+            return symbol?.value?.replace("_", "")?.replace("/", "") to direction
         }
     }
 }

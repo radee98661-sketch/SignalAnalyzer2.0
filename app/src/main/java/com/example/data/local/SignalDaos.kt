@@ -253,6 +253,18 @@ interface CoreDao {
     @Query("UPDATE raw_notifications SET duplicate_reason=:reason WHERE id=:id")
     suspend fun setDuplicateReason(id: Long, reason: String)
 
+    @Query("SELECT * FROM raw_notifications WHERE is_duplicate = 0 AND duplicate_reason LIKE 'signal_update:%' ORDER BY id")
+    suspend fun getSignalUpdateRawNotifications(): List<RawNotificationEntity>
+
+    @Query("SELECT * FROM raw_notifications WHERE duplicate_group_id = :groupId ORDER BY id")
+    suspend fun getRawNotificationsByGroupId(groupId: String): List<RawNotificationEntity>
+
+    @Query("UPDATE raw_notifications SET duplicate_reason = NULL, duplicate_group_id = NULL WHERE id = :id")
+    suspend fun clearFalseSignalUpdate(id: Long)
+
+    @Query("UPDATE raw_notifications SET duplicate_group_id = NULL WHERE id = :id")
+    suspend fun clearOrphanDuplicateGroup(id: Long)
+
     @Query("UPDATE raw_notifications SET notification_time=:notificationTime WHERE id=(SELECT raw_notification_id FROM signals WHERE id=:signalId)")
     suspend fun updateNotificationTimeForSignal(signalId: Long, notificationTime: String)
 
